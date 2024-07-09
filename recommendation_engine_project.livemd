@@ -1,0 +1,309 @@
+<!-- livebook:{"persist_outputs":true} -->
+
+# Recommendation Engine Project
+
+```elixir
+Mix.install([
+  {:nx, "~> 0.7"},
+  {:axon, "~> 0.6"},
+  {:explorer, "~> 0.8"},
+  {:kino, "~> 0.13"},
+  {:vega_lite, "~> 0.1"},
+  {:httpoison, "~> 2.2"},
+  {:csv, "~> 3.2"}
+])
+
+alias Explorer.DataFrame
+alias Explorer.Series
+alias VegaLite, as: Vl
+
+defmodule DataLoader do
+  def download_movielens_small do
+    url = "https://files.grouplens.org/datasets/movielens/ml-latest-small.zip"
+    {:ok, %{body: body}} = HTTPoison.get(url)
+    
+    {:ok, files} = :zip.unzip(body, [:memory])
+    
+    ratings_csv = Enum.find_value(files, fn {name, content} ->
+      name = to_string(name)
+      if String.ends_with?(name, "ratings.csv"), do: content
+    end)
+    
+    ratings_csv
+  end
+end
+
+# Download and load the dataset
+ratings_csv = DataLoader.download_movielens_small()
+ratings_df = DataFrame.load_csv!(ratings_csv)
+
+# Display the first few rows
+IO.inspect(DataFrame.head(ratings_df), label: "First few rows of ratings")
+
+# Print some information about the dataset
+IO.puts("Number of rows: #{DataFrame.n_rows(ratings_df)}")
+IO.puts("Number of columns: #{DataFrame.n_columns(ratings_df)}")
+IO.inspect(DataFrame.names(ratings_df), label: "Column names")
+```
+
+## Preprocessing Data
+
+```elixir
+# Preprocess the data
+users = DataFrame.pull(ratings_df, "userId")
+movies = DataFrame.pull(ratings_df, "movieId")
+ratings = DataFrame.pull(ratings_df, "rating")
+
+n_users = users |> Series.distinct() |> Series.count()
+n_movies = movies |> Series.distinct() |> Series.count()
+
+# Convert to tensors
+x_users = Nx.tensor(Series.to_list(users))
+x_movies = Nx.tensor(Series.to_list(movies))
+y_ratings = Nx.tensor(Series.to_list(ratings))
+
+# Print some information about the preprocessed data
+IO.puts("Number of unique users: #{n_users}")
+IO.puts("Number of unique movies: #{n_movies}")
+IO.puts("Shape of x_users tensor: #{inspect(Nx.shape(x_users))}")
+IO.puts("Shape of x_movies tensor: #{inspect(Nx.shape(x_movies))}")
+IO.puts("Shape of y_ratings tensor: #{inspect(Nx.shape(y_ratings))}")
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+Number of unique users: 610
+Number of unique movies: 9724
+Shape of x_users tensor: {100836}
+Shape of x_movies tensor: {100836}
+Shape of y_ratings tensor: {100836}
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+## Training and testing sets data
+
+```elixir
+# Split the data into training and testing sets
+train_ratio = 0.8
+train_size = floor(Nx.size(x_users) * train_ratio)
+
+{x_users_train, x_users_test} = Nx.split(x_users, train_size)
+{x_movies_train, x_movies_test} = Nx.split(x_movies, train_size)
+{y_ratings_train, y_ratings_test} = Nx.split(y_ratings, train_size)
+
+# Print information about the split
+IO.puts("Shape of x_users_train: #{inspect(Nx.shape(x_users_train))}")
+IO.puts("Shape of x_users_test: #{inspect(Nx.shape(x_users_test))}")
+IO.puts("Shape of x_movies_train: #{inspect(Nx.shape(x_movies_train))}")
+IO.puts("Shape of x_movies_test: #{inspect(Nx.shape(x_movies_test))}")
+IO.puts("Shape of y_ratings_train: #{inspect(Nx.shape(y_ratings_train))}")
+IO.puts("Shape of y_ratings_test: #{inspect(Nx.shape(y_ratings_test))}")
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+Shape of x_users_train: {80668}
+Shape of x_users_test: {20168}
+Shape of x_movies_train: {80668}
+Shape of x_movies_test: {20168}
+Shape of y_ratings_train: {80668}
+Shape of y_ratings_test: {20168}
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+## Prepare Data
+
+```elixir
+# Prepare the data
+users = DataFrame.pull(ratings_df, "userId")
+movies = DataFrame.pull(ratings_df, "movieId")
+ratings = DataFrame.pull(ratings_df, "rating")
+
+n_users = users |> Series.distinct() |> Series.count()
+n_movies = movies |> Series.distinct() |> Series.count()
+
+# Convert to tensors
+x_users = Nx.tensor(Series.to_list(users))
+x_movies = Nx.tensor(Series.to_list(movies))
+y_ratings = Nx.tensor(Series.to_list(ratings))
+
+# Print some information
+IO.puts("Number of unique users: #{n_users}")
+IO.puts("Number of unique movies: #{n_movies}")
+IO.puts("Shape of ratings tensor: #{inspect(Nx.shape(y_ratings))}")
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+Number of unique users: 610
+Number of unique movies: 9724
+Shape of ratings tensor: {100836}
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
+```
+
+## Matrix Model
+
+```elixir
+# Create mappings for user IDs and movie IDs
+user_id_map = users |> Series.distinct() |> Series.to_list() |> Enum.with_index() |> Map.new()
+movie_id_map = movies |> Series.distinct() |> Series.to_list() |> Enum.with_index() |> Map.new()
+
+n_users = map_size(user_id_map)
+n_movies = map_size(movie_id_map)
+
+IO.puts("Number of unique users: #{n_users}")
+IO.puts("Number of unique movies: #{n_movies}")
+
+
+defmodule MatrixFactorization do
+  import Nx.Defn
+
+  def init_params(n_users, n_movies, n_factors) do
+    user_factors = Nx.multiply(Nx.broadcast(0.1, {n_users, n_factors}), Nx.tensor(Enum.map(1..(n_users * n_factors), fn _ -> :rand.uniform() end)) |> Nx.reshape({n_users, n_factors}))
+    movie_factors = Nx.multiply(Nx.broadcast(0.1, {n_movies, n_factors}), Nx.tensor(Enum.map(1..(n_movies * n_factors), fn _ -> :rand.uniform() end)) |> Nx.reshape({n_movies, n_factors}))
+    {user_factors, movie_factors}
+  end
+
+  defn predict({user_factors, movie_factors}, user_ids, movie_ids) do
+    users = Nx.take(user_factors, user_ids)
+    movies = Nx.take(movie_factors, movie_ids)
+    Nx.sum(users * movies, axes: [1])
+  end
+
+  defn loss({user_factors, movie_factors}, user_ids, movie_ids, ratings, lambda) do
+    pred = predict({user_factors, movie_factors}, user_ids, movie_ids)
+    mse = Nx.mean(Nx.pow(pred - ratings, 2))
+    reg_user = lambda * Nx.mean(Nx.pow(user_factors, 2))
+    reg_movie = lambda * Nx.mean(Nx.pow(movie_factors, 2))
+    mse + reg_user + reg_movie
+  end
+
+  defn update({user_factors, movie_factors}, user_ids, movie_ids, ratings, lr, lambda) do
+    {grad_users, grad_movies} = grad({user_factors, movie_factors}, &loss(&1, user_ids, movie_ids, ratings, lambda))
+    {
+      user_factors - lr * grad_users,
+      movie_factors - lr * grad_movies
+    }
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+Number of unique users: 610
+Number of unique movies: 9724
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, MatrixFactorization, <<70, 79, 82, 49, 0, 0, 22, ...>>, true}
+```
+
+## Model Train
+
+```elixir
+# Model parameters
+n_factors = 50  # Increased from 20
+initial_learning_rate = 0.01
+lambda = 0.001  # Reduced regularization
+n_epochs = 50  # Increased from 10
+batch_size = 1024
+
+# Initialize model
+params = MatrixFactorization.init_params(n_users, n_movies, n_factors)
+
+# Convert to tensors using the mappings
+x_users = Nx.tensor(Enum.map(Series.to_list(users), &Map.get(user_id_map, &1)))
+x_movies = Nx.tensor(Enum.map(Series.to_list(movies), &Map.get(movie_id_map, &1)))
+y_ratings = Nx.tensor(Series.to_list(ratings))
+
+# Split the data into training and testing sets
+train_ratio = 0.8
+train_size = floor(Nx.size(x_users) * train_ratio)
+
+{x_users_train, x_users_test} = Nx.split(x_users, train_size)
+{x_movies_train, x_movies_test} = Nx.split(x_movies, train_size)
+{y_ratings_train, y_ratings_test} = Nx.split(y_ratings, train_size)
+
+# Training loop with learning rate decay
+Enum.reduce(1..n_epochs, params, fn epoch, current_params ->
+  learning_rate = initial_learning_rate / :math.sqrt(epoch)
+  
+  {total_loss, batch_count, new_params} =
+    Enum.reduce(0..(Nx.size(x_users_train) - 1)//batch_size, {Nx.tensor(0.0), 0, current_params}, fn i, {acc_loss, acc_count, params} ->
+      batch_size = min(batch_size, Nx.size(x_users_train) - i)
+      batch_users = Nx.slice(x_users_train, [i], [batch_size])
+      batch_movies = Nx.slice(x_movies_train, [i], [batch_size])
+      batch_ratings = Nx.slice(y_ratings_train, [i], [batch_size])
+      
+      new_params = MatrixFactorization.update(params, batch_users, batch_movies, batch_ratings, learning_rate, lambda)
+      loss = MatrixFactorization.loss(new_params, batch_users, batch_movies, batch_ratings, lambda)
+      {Nx.add(acc_loss, loss), acc_count + 1, new_params}
+    end)
+
+  avg_loss = Nx.to_number(Nx.divide(total_loss, batch_count))
+  IO.puts("Epoch #{epoch}, Average Loss: #{avg_loss}, Learning Rate: #{learning_rate}")
+  
+  new_params
+end)
+
+IO.puts("Training completed!")
+
+# Evaluate on test set
+test_loss = MatrixFactorization.loss(params, x_users_test, x_movies_test, y_ratings_test, lambda)
+IO.puts("Test Loss: #{Nx.to_number(test_loss)}")
+
+# Function to make predictions
+predict_rating = fn user_id, movie_id ->
+  user_index = Map.get(user_id_map, user_id)
+  movie_index = Map.get(movie_id_map, movie_id)
+  prediction = MatrixFactorization.predict(params, Nx.tensor([user_index]), Nx.tensor([movie_index]))
+  Nx.to_number(prediction)
+end
+
+# Example predictions
+IO.puts("Example predictions:")
+IO.puts("User 1, Movie 1: #{predict_rating.(1, 1)}")
+IO.puts("User 1, Movie 100: #{predict_rating.(1, 100)}")
+IO.puts("User 100, Movie 1: #{predict_rating.(100, 1)}")
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+Epoch 1, Average Loss: 12.56071949005127, Learning Rate: 0.01
+Epoch 2, Average Loss: 12.535378456115723, Learning Rate: 0.0070710678118654745
+Epoch 3, Average Loss: 12.515412330627441, Learning Rate: 0.005773502691896258
+Epoch 4, Average Loss: 12.498332023620605, Learning Rate: 0.005
+Epoch 5, Average Loss: 12.483138084411621, Learning Rate: 0.004472135954999579
+Epoch 6, Average Loss: 12.46930980682373, Learning Rate: 0.004082482904638631
+Epoch 7, Average Loss: 12.456523895263672, Learning Rate: 0.003779644730092272
+Epoch 8, Average Loss: 12.444571495056152, Learning Rate: 0.0035355339059327372
+Epoch 9, Average Loss: 12.433304786682129, Learning Rate: 0.0033333333333333335
+Epoch 10, Average Loss: 12.422614097595215, Learning Rate: 0.0031622776601683794
+Epoch 11, Average Loss: 12.412415504455566, Learning Rate: 0.0030151134457776364
+Epoch 12, Average Loss: 12.402647018432617, Learning Rate: 0.002886751345948129
+Epoch 13, Average Loss: 12.393255233764648, Learning Rate: 0.002773500981126146
+Epoch 14, Average Loss: 12.384199142456055, Learning Rate: 0.002672612419124244
+Epoch 15, Average Loss: 12.375444412231445, Learning Rate: 0.0025819888974716113
+```
