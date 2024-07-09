@@ -10,7 +10,8 @@ Mix.install([
   {:kino, "~> 0.13"},
   {:vega_lite, "~> 0.1"},
   {:httpoison, "~> 2.2"},
-  {:csv, "~> 3.2"}
+  {:csv, "~> 3.2"},
+  {:kino_vega_lite, "~> 0.1.11"}
 ])
 
 alias Explorer.DataFrame
@@ -21,14 +22,15 @@ defmodule DataLoader do
   def download_movielens_small do
     url = "https://files.grouplens.org/datasets/movielens/ml-latest-small.zip"
     {:ok, %{body: body}} = HTTPoison.get(url)
-    
+
     {:ok, files} = :zip.unzip(body, [:memory])
-    
-    ratings_csv = Enum.find_value(files, fn {name, content} ->
-      name = to_string(name)
-      if String.ends_with?(name, "ratings.csv"), do: content
-    end)
-    
+
+    ratings_csv =
+      Enum.find_value(files, fn {name, content} ->
+        name = to_string(name)
+        if String.ends_with?(name, "ratings.csv"), do: content
+      end)
+
     ratings_csv
   end
 end
@@ -310,18 +312,76 @@ IO.puts("User #{Enum.at(user_id_list, 99)}, Movie #{Enum.at(movie_id_list, 0)}: 
 <!-- livebook:{"output":true} -->
 
 ```
-Epoch 1, Average Loss: 408.0029296875, Learning Rate: 0.2
-Epoch 2, Average Loss: 368.6095275878906, Learning Rate: 0.19
-Epoch 3, Average Loss: 334.7301330566406, Learning Rate: 0.1805
-Epoch 4, Average Loss: 305.4458312988281, Learning Rate: 0.171475
-Epoch 5, Average Loss: 280.0125427246094, Learning Rate: 0.16290125
-Epoch 6, Average Loss: 257.82366943359375, Learning Rate: 0.15475618749999998
-Epoch 7, Average Loss: 238.38201904296875, Learning Rate: 0.14701837812499996
+Epoch 1, Average Loss: 408.76544189453125, Learning Rate: 0.2
+Epoch 2, Average Loss: 369.2974853515625, Learning Rate: 0.19
+Epoch 3, Average Loss: 335.3540344238281, Learning Rate: 0.1805
+Epoch 4, Average Loss: 306.01458740234375, Learning Rate: 0.171475
+Epoch 5, Average Loss: 280.533447265625, Learning Rate: 0.16290125
+Epoch 6, Average Loss: 258.30291748046875, Learning Rate: 0.15475618749999998
+Epoch 7, Average Loss: 238.82484436035156, Learning Rate: 0.14701837812499996
+Epoch 8, Average Loss: 221.68881225585938, Learning Rate: 0.13966745921874996
+Epoch 9, Average Loss: 206.55491638183594, Learning Rate: 0.13268408625781244
+Epoch 10, Average Loss: 193.14007568359375, Learning Rate: 0.1260498819449218
+Epoch 11, Average Loss: 181.20755004882812, Learning Rate: 0.11974738784767575
+Epoch 12, Average Loss: 170.55845642089844, Learning Rate: 0.11376001845529193
+Epoch 13, Average Loss: 161.02484130859375, Learning Rate: 0.10807201753252733
+Epoch 14, Average Loss: 152.46441650390625, Learning Rate: 0.10266841665590097
+Epoch 15, Average Loss: 144.75604248046875, Learning Rate: 0.09753499582310592
+Epoch 16, Average Loss: 137.79627990722656, Learning Rate: 0.09265824603195061
+Epoch 17, Average Loss: 131.49635314941406, Learning Rate: 0.08802533373035308
+Epoch 18, Average Loss: 125.77989196777344, Learning Rate: 0.08362406704383542
+Epoch 19, Average Loss: 120.58089447021484, Learning Rate: 0.07944286369164365
+Epoch 20, Average Loss: 115.84219360351562, Learning Rate: 0.07547072050706145
+Epoch 21, Average Loss: 111.51406860351562, Learning Rate: 0.07169718448170838
+Epoch 22, Average Loss: 107.55310821533203, Learning Rate: 0.06811232525762297
+Epoch 23, Average Loss: 103.92142486572266, Learning Rate: 0.0647067089947418
+Epoch 24, Average Loss: 100.58570861816406, Learning Rate: 0.06147137354500472
+Epoch 25, Average Loss: 97.51663970947266, Learning Rate: 0.05839780486775448
+Epoch 26, Average Loss: 94.68840026855469, Learning Rate: 0.055477914624366756
+Epoch 27, Average Loss: 92.07809448242188, Learning Rate: 0.05270401889314841
+Epoch 28, Average Loss: 89.66547393798828, Learning Rate: 0.05006881794849099
+Epoch 29, Average Loss: 87.43245697021484, Learning Rate: 0.047565377051066435
+Epoch 30, Average Loss: 85.36300659179688, Learning Rate: 0.04518710819851311
+Epoch 31, Average Loss: 83.44274139404297, Learning Rate: 0.04292775278858746
+Epoch 32, Average Loss: 81.6588134765625, Learning Rate: 0.04078136514915808
+Epoch 33, Average Loss: 79.99971771240234, Learning Rate: 0.038742296891700174
+Epoch 34, Average Loss: 78.45502471923828, Learning Rate: 0.036805182047115165
+Epoch 35, Average Loss: 77.01543426513672, Learning Rate: 0.034964922944759405
+Epoch 36, Average Loss: 75.67249298095703, Learning Rate: 0.03321667679752143
+Epoch 37, Average Loss: 74.41857147216797, Learning Rate: 0.03155584295764536
+Epoch 38, Average Loss: 73.24674987792969, Learning Rate: 0.029978050809763093
+Epoch 39, Average Loss: 72.1507568359375, Learning Rate: 0.028479148269274935
+Epoch 40, Average Loss: 71.12488555908203, Learning Rate: 0.027055190855811186
+Epoch 41, Average Loss: 70.16393280029297, Learning Rate: 0.025702431313020625
+Epoch 42, Average Loss: 69.26317596435547, Learning Rate: 0.024417309747369595
+Epoch 43, Average Loss: 68.41825103759766, Learning Rate: 0.023196444260001114
+Epoch 44, Average Loss: 67.62521362304688, Learning Rate: 0.022036622047001058
+Epoch 45, Average Loss: 66.88041687011719, Learning Rate: 0.020934790944651005
+Epoch 46, Average Loss: 66.18052673339844, Learning Rate: 0.01988805139741845
+Epoch 47, Average Loss: 65.52247619628906, Learning Rate: 0.01889364882754753
+Epoch 48, Average Loss: 64.90345001220703, Learning Rate: 0.01794896638617015
+Epoch 49, Average Loss: 64.32083892822266, Learning Rate: 0.01705151806686164
+Epoch 50, Average Loss: 63.77224349975586, Learning Rate: 0.01619894216351856
+Training completed!
+Full Dataset Loss: 63.52693176269531
+Example predictions:
+User 1, Movie 1: 0.9534629583358765
+User 1, Movie 1552: 0.23956403136253357
+User 100, Movie 1: 0.4093063473701477
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+:ok
 ```
 
 ## Visualizations using VegaLite
 
 ```elixir
+alias VegaLite, as: Vl
+require Kino.VegaLite
+
 # Function to get top N recommendations
 get_top_n_recommendations = fn user_id, n ->
   movie_id_map
@@ -342,12 +402,14 @@ recommendation_data = Enum.map(top_10_recommendations, fn {movie_id, rating} ->
 end)
 
 # Create the visualization
-Vl.new(width: 400, height: 300)
+graph = Vl.new(width: 400, height: 300)
 |> Vl.data_from_values(recommendation_data)
 |> Vl.mark(:bar)
 |> Vl.encode_field(:x, "movie_id", type: :nominal, title: "Movie ID")
 |> Vl.encode_field(:y, "predicted_rating", type: :quantitative, title: "Predicted Rating")
 |> Vl.encode_field(:color, "predicted_rating", type: :quantitative)
-|> Vl.title("Top 10 Movie Recommendations for User #{user_id}")
+|> Vl.config(title: %{text: "Top 10 Movie Recommendations for User #{user_id}"})
 
+# Display the graph
+Kino.VegaLite.new(graph)
 ```
