@@ -177,9 +177,15 @@ defmodule MatrixFactorization do
   import Nx.Defn
 
   def init_params(n_users, n_movies, n_factors) do
-    user_factors = Nx.multiply(Nx.broadcast(0.1, {n_users, n_factors}), Nx.tensor(Enum.map(1..(n_users * n_factors), fn _ -> :rand.uniform() end)) |> Nx.reshape({n_users, n_factors}))
-    movie_factors = Nx.multiply(Nx.broadcast(0.1, {n_movies, n_factors}), Nx.tensor(Enum.map(1..(n_movies * n_factors), fn _ -> :rand.uniform() end)) |> Nx.reshape({n_movies, n_factors}))
+    user_factors = random_tensor({n_users, n_factors}, 1.0)
+    movie_factors = random_tensor({n_movies, n_factors}, 1.0)
     {user_factors, movie_factors}
+  end
+
+  def random_tensor(shape, scale) do
+    size = Tuple.product(shape)
+    data = for _ <- 1..size, do: (:rand.uniform() - 0.5) * scale
+    Nx.tensor(data, type: {:f, 32}) |> Nx.reshape(shape)
   end
 
   defn predict({user_factors, movie_factors}, user_ids, movie_ids) do
@@ -191,19 +197,19 @@ defmodule MatrixFactorization do
   defn loss({user_factors, movie_factors}, user_ids, movie_ids, ratings, lambda) do
     pred = predict({user_factors, movie_factors}, user_ids, movie_ids)
     mse = Nx.mean(Nx.pow(pred - ratings, 2))
-    reg_user = lambda * Nx.mean(Nx.pow(user_factors, 2))
-    reg_movie = lambda * Nx.mean(Nx.pow(movie_factors, 2))
-    mse + reg_user + reg_movie
+    reg = lambda * (Nx.sum(Nx.pow(user_factors, 2)) + Nx.sum(Nx.pow(movie_factors, 2)))
+    mse + reg
   end
 
   defn update({user_factors, movie_factors}, user_ids, movie_ids, ratings, lr, lambda) do
-    {grad_users, grad_movies} = grad({user_factors, movie_factors}, &loss(&1, user_ids, movie_ids, ratings, lambda))
+    grad = grad({user_factors, movie_factors}, &loss(&1, user_ids, movie_ids, ratings, lambda))
     {
-      user_factors - lr * grad_users,
-      movie_factors - lr * grad_movies
+      user_factors - lr * elem(grad, 0),
+      movie_factors - lr * elem(grad, 1)
     }
   end
 end
+
 ```
 
 <!-- livebook:{"output":true} -->
@@ -222,32 +228,43 @@ Number of unique movies: 9724
 ## Model Train
 
 ```elixir
-# Model parameters
-n_factors = 50  # Increased from 20
-initial_learning_rate = 0.01
-lambda = 0.001  # Reduced regularization
-n_epochs = 50  # Increased from 10
-batch_size = 1024
+# Data Preprocessing
+user_id_list = users |> Series.distinct() |> Series.to_list()
+movie_id_list = movies |> Series.distinct() |> Series.to_list()
 
-# Initialize model
-params = MatrixFactorization.init_params(n_users, n_movies, n_factors)
+user_id_map = Enum.with_index(user_id_list) |> Map.new(fn {id, index} -> {id, index} end)
+movie_id_map = Enum.with_index(movie_id_list) |> Map.new(fn {id, index} -> {id, index} end)
+
+n_users = map_size(user_id_map)
+n_movies = map_size(movie_id_map)
 
 # Convert to tensors using the mappings
 x_users = Nx.tensor(Enum.map(Series.to_list(users), &Map.get(user_id_map, &1)))
 x_movies = Nx.tensor(Enum.map(Series.to_list(movies), &Map.get(movie_id_map, &1)))
-y_ratings = Nx.tensor(Series.to_list(ratings))
 
-# Split the data into training and testing sets
-train_ratio = 0.8
-train_size = floor(Nx.size(x_users) * train_ratio)
+# Normalize ratings to [0, 1] range
+{min_rating, max_rating} = Enum.min_max(Series.to_list(ratings))
+y_ratings = Nx.tensor(Enum.map(Series.to_list(ratings), fn r -> (r - min_rating) / (max_rating - min_rating) end))
 
-{x_users_train, x_users_test} = Nx.split(x_users, train_size)
-{x_movies_train, x_movies_test} = Nx.split(x_movies, train_size)
-{y_ratings_train, y_ratings_test} = Nx.split(y_ratings, train_size)
+# Model parameters
+n_factors = 50
+initial_learning_rate = 0.2
+decay_rate = 0.95
+n_epochs = 50
+batch_size = 8192
+lambda = 0.01  # L2 regularization strength
+
+# Use full dataset instead of sampling
+x_users_train = x_users
+x_movies_train = x_movies
+y_ratings_train = y_ratings
+
+# Initialize model
+params = MatrixFactorization.init_params(n_users, n_movies, n_factors)
 
 # Training loop with learning rate decay
-Enum.reduce(1..n_epochs, params, fn epoch, current_params ->
-  learning_rate = initial_learning_rate / :math.sqrt(epoch)
+final_params = Enum.reduce(1..n_epochs, params, fn epoch, current_params ->
+  current_lr = initial_learning_rate * :math.pow(decay_rate, epoch - 1)
   
   {total_loss, batch_count, new_params} =
     Enum.reduce(0..(Nx.size(x_users_train) - 1)//batch_size, {Nx.tensor(0.0), 0, current_params}, fn i, {acc_loss, acc_count, params} ->
@@ -256,54 +273,81 @@ Enum.reduce(1..n_epochs, params, fn epoch, current_params ->
       batch_movies = Nx.slice(x_movies_train, [i], [batch_size])
       batch_ratings = Nx.slice(y_ratings_train, [i], [batch_size])
       
-      new_params = MatrixFactorization.update(params, batch_users, batch_movies, batch_ratings, learning_rate, lambda)
+      new_params = MatrixFactorization.update(params, batch_users, batch_movies, batch_ratings, current_lr, lambda)
       loss = MatrixFactorization.loss(new_params, batch_users, batch_movies, batch_ratings, lambda)
       {Nx.add(acc_loss, loss), acc_count + 1, new_params}
     end)
 
   avg_loss = Nx.to_number(Nx.divide(total_loss, batch_count))
-  IO.puts("Epoch #{epoch}, Average Loss: #{avg_loss}, Learning Rate: #{learning_rate}")
+  IO.puts("Epoch #{epoch}, Average Loss: #{avg_loss}, Learning Rate: #{current_lr}")
   
   new_params
 end)
 
 IO.puts("Training completed!")
 
-# Evaluate on test set
-test_loss = MatrixFactorization.loss(params, x_users_test, x_movies_test, y_ratings_test, lambda)
-IO.puts("Test Loss: #{Nx.to_number(test_loss)}")
+# Evaluate on full dataset
+full_loss = MatrixFactorization.loss(final_params, x_users, x_movies, y_ratings, lambda)
+IO.puts("Full Dataset Loss: #{Nx.to_number(full_loss)}")
 
 # Function to make predictions
 predict_rating = fn user_id, movie_id ->
   user_index = Map.get(user_id_map, user_id)
   movie_index = Map.get(movie_id_map, movie_id)
-  prediction = MatrixFactorization.predict(params, Nx.tensor([user_index]), Nx.tensor([movie_index]))
-  Nx.to_number(prediction)
+  prediction = MatrixFactorization.predict(final_params, Nx.tensor([user_index]), Nx.tensor([movie_index]))
+  denormalized = Nx.multiply(prediction, max_rating - min_rating) |> Nx.add(min_rating)
+  Nx.to_number(Nx.squeeze(denormalized))
 end
 
 # Example predictions
 IO.puts("Example predictions:")
-IO.puts("User 1, Movie 1: #{predict_rating.(1, 1)}")
-IO.puts("User 1, Movie 100: #{predict_rating.(1, 100)}")
-IO.puts("User 100, Movie 1: #{predict_rating.(100, 1)}")
+IO.puts("User #{Enum.at(user_id_list, 0)}, Movie #{Enum.at(movie_id_list, 0)}: #{predict_rating.(Enum.at(user_id_list, 0), Enum.at(movie_id_list, 0))}")
+IO.puts("User #{Enum.at(user_id_list, 0)}, Movie #{Enum.at(movie_id_list, 99)}: #{predict_rating.(Enum.at(user_id_list, 0), Enum.at(movie_id_list, 99))}")
+IO.puts("User #{Enum.at(user_id_list, 99)}, Movie #{Enum.at(movie_id_list, 0)}: #{predict_rating.(Enum.at(user_id_list, 99), Enum.at(movie_id_list, 0))}")
+
 ```
 
 <!-- livebook:{"output":true} -->
 
 ```
-Epoch 1, Average Loss: 12.56071949005127, Learning Rate: 0.01
-Epoch 2, Average Loss: 12.535378456115723, Learning Rate: 0.0070710678118654745
-Epoch 3, Average Loss: 12.515412330627441, Learning Rate: 0.005773502691896258
-Epoch 4, Average Loss: 12.498332023620605, Learning Rate: 0.005
-Epoch 5, Average Loss: 12.483138084411621, Learning Rate: 0.004472135954999579
-Epoch 6, Average Loss: 12.46930980682373, Learning Rate: 0.004082482904638631
-Epoch 7, Average Loss: 12.456523895263672, Learning Rate: 0.003779644730092272
-Epoch 8, Average Loss: 12.444571495056152, Learning Rate: 0.0035355339059327372
-Epoch 9, Average Loss: 12.433304786682129, Learning Rate: 0.0033333333333333335
-Epoch 10, Average Loss: 12.422614097595215, Learning Rate: 0.0031622776601683794
-Epoch 11, Average Loss: 12.412415504455566, Learning Rate: 0.0030151134457776364
-Epoch 12, Average Loss: 12.402647018432617, Learning Rate: 0.002886751345948129
-Epoch 13, Average Loss: 12.393255233764648, Learning Rate: 0.002773500981126146
-Epoch 14, Average Loss: 12.384199142456055, Learning Rate: 0.002672612419124244
-Epoch 15, Average Loss: 12.375444412231445, Learning Rate: 0.0025819888974716113
+Epoch 1, Average Loss: 408.0029296875, Learning Rate: 0.2
+Epoch 2, Average Loss: 368.6095275878906, Learning Rate: 0.19
+Epoch 3, Average Loss: 334.7301330566406, Learning Rate: 0.1805
+Epoch 4, Average Loss: 305.4458312988281, Learning Rate: 0.171475
+Epoch 5, Average Loss: 280.0125427246094, Learning Rate: 0.16290125
+Epoch 6, Average Loss: 257.82366943359375, Learning Rate: 0.15475618749999998
+Epoch 7, Average Loss: 238.38201904296875, Learning Rate: 0.14701837812499996
+```
+
+## Visualizations using VegaLite
+
+```elixir
+# Function to get top N recommendations
+get_top_n_recommendations = fn user_id, n ->
+  movie_id_map
+  |> Enum.map(fn {movie_id, _} ->
+    {movie_id, predict_rating.(user_id, movie_id)}
+  end)
+  |> Enum.sort_by(&elem(&1, 1), :desc)
+  |> Enum.take(n)
+end
+
+# Get recommendations for the first user
+user_id = Enum.at(user_id_list, 0)
+top_10_recommendations = get_top_n_recommendations.(user_id, 10)
+
+# Prepare data for visualization
+recommendation_data = Enum.map(top_10_recommendations, fn {movie_id, rating} ->
+  %{movie_id: to_string(movie_id), predicted_rating: rating}
+end)
+
+# Create the visualization
+Vl.new(width: 400, height: 300)
+|> Vl.data_from_values(recommendation_data)
+|> Vl.mark(:bar)
+|> Vl.encode_field(:x, "movie_id", type: :nominal, title: "Movie ID")
+|> Vl.encode_field(:y, "predicted_rating", type: :quantitative, title: "Predicted Rating")
+|> Vl.encode_field(:color, "predicted_rating", type: :quantitative)
+|> Vl.title("Top 10 Movie Recommendations for User #{user_id}")
+
 ```
