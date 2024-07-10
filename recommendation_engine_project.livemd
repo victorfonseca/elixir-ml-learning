@@ -3,178 +3,303 @@
 # Recommendation Engine Project
 
 ```elixir
+# Recommendation Engine Project
+
 Mix.install([
-  {:nx, "~> 0.7"},
-  {:axon, "~> 0.6"},
+  {:nx, "~> 0.7.1"},
   {:explorer, "~> 0.8"},
-  {:kino, "~> 0.13"},
-  {:vega_lite, "~> 0.1"},
-  {:httpoison, "~> 2.2"},
-  {:csv, "~> 3.2"},
-  {:kino_vega_lite, "~> 0.1.11"}
+  {:httpoison, "~> 2.1"},
+  {:jason, "~> 1.4"}
 ])
 
 alias Explorer.DataFrame
 alias Explorer.Series
-alias VegaLite, as: Vl
+```
 
-defmodule DataLoader do
-  def download_movielens_small do
-    url = "https://files.grouplens.org/datasets/movielens/ml-latest-small.zip"
-    {:ok, %{body: body}} = HTTPoison.get(url)
+## ArrangoDB Client
 
-    {:ok, files} = :zip.unzip(body, [:memory])
+```elixir
+defmodule ArangoDBClient do
+  use HTTPoison.Base
 
-    ratings_csv =
-      Enum.find_value(files, fn {name, content} ->
-        name = to_string(name)
-        if String.ends_with?(name, "ratings.csv"), do: content
-      end)
+  @base_url "http://arangodb:8529"
+  @username "root"
+  @password "vscode"
+  @db_name "movie_recommendations"
 
-    ratings_csv
+  def process_url(url), do: @base_url <> url
+
+  def process_request_headers(headers) do
+    auth = Base.encode64("#{@username}:#{@password}")
+    [{"Authorization", "Basic #{auth}"} | headers]
+  end
+
+  def process_response_body(body), do: Jason.decode!(body)
+
+  def setup_database do
+    delete_database()
+    create_database()
+    create_collections()
+    create_graph()
+  end
+
+  def create_database do
+    case post("/_api/database", Jason.encode!(%{name: @db_name})) do
+      {:ok, %{status_code: 201}} -> IO.puts("Database '#{@db_name}' created.")
+      {:ok, %{status_code: 202}} -> IO.puts("Database '#{@db_name}' creation request accepted.")
+      {:error, %{reason: reason}} -> IO.puts("Error creating database: #{reason}")
+      unexpected -> IO.puts("Unexpected response while creating database: #{inspect(unexpected)}")
+    end
+  end
+
+  def create_collections do
+    for collection <- ["users", "movies"] do
+      case post("/_db/#{@db_name}/_api/collection", Jason.encode!(%{name: collection})) do
+        {:ok, %{status_code: 200}} -> IO.puts("Collection '#{collection}' created.")
+        {:ok, %{status_code: 202}} -> IO.puts("Collection '#{collection}' creation request accepted.")
+        {:error, %{reason: reason}} -> IO.puts("Error creating collection '#{collection}': #{reason}")
+        unexpected -> IO.puts("Unexpected response while creating collection '#{collection}': #{inspect(unexpected)}")
+      end
+    end
+
+    case post("/_db/#{@db_name}/_api/collection", Jason.encode!(%{name: "ratings", type: 3})) do
+      {:ok, %{status_code: 200}} -> IO.puts("Edge collection 'ratings' created.")
+      {:ok, %{status_code: 202}} -> IO.puts("Edge collection 'ratings' creation request accepted.")
+      {:error, %{reason: reason}} -> IO.puts("Error creating edge collection 'ratings': #{reason}")
+      unexpected -> IO.puts("Unexpected response while creating edge collection 'ratings': #{inspect(unexpected)}")
+    end
+  end
+
+  def has_data? do
+    case get_collection_count("ratings") do
+      {:ok, count} when count > 0 -> true
+      _ -> false
+    end
+  end
+
+  def get_collection_count(collection) do
+    case get("/_db/#{@db_name}/_api/collection/#{collection}/count") do
+      {:ok, %{status_code: 200, body: %{"count" => count}}} ->
+        {:ok, count}
+      {:error, reason} ->
+        IO.puts("Error getting count for #{collection}: #{inspect(reason)}")
+        {:error, reason}
+      unexpected ->
+        IO.puts("Unexpected response while getting count for #{collection}: #{inspect(unexpected)}")
+        {:error, :unexpected_response}
+    end
+  end
+
+  def create_graph do
+    graph_body = %{
+      name: "movie_ratings",
+      edgeDefinitions: [
+        %{
+          collection: "ratings",
+          from: ["users"],
+          to: ["movies"]
+        }
+      ]
+    }
+    case post("/_db/#{@db_name}/_api/gharial", Jason.encode!(graph_body)) do
+      {:ok, %{status_code: 201}} -> IO.puts("Graph 'movie_ratings' created.")
+      {:ok, %{status_code: 202, body: body}} ->
+        IO.puts("Graph 'movie_ratings' created with status 202.")
+        IO.inspect(body, label: "Response body")
+      {:error, %{reason: reason}} -> IO.puts("Error creating graph: #{reason}")
+      unexpected -> IO.puts("Unexpected response while creating graph: #{inspect(unexpected)}")
+    end
+  end
+
+  def delete_database do
+    case delete("/_api/database/#{@db_name}") do
+      {:ok, %{status_code: 200}} -> IO.puts("Database '#{@db_name}' deleted.")
+      {:ok, %{status_code: 202}} -> IO.puts("Database '#{@db_name}' deletion request accepted.")
+      {:ok, %{status_code: 404}} -> IO.puts("Database '#{@db_name}' does not exist.")
+      {:error, %{reason: reason}} -> IO.puts("Error deleting database: #{reason}")
+      unexpected -> IO.puts("Unexpected response while deleting database: #{inspect(unexpected)}")
+    end
+  end
+
+  def load_data do
+    try do
+      users = get_all_documents("users")
+      movies = get_all_documents("movies")
+      ratings = get_all_documents("ratings")
+      {:ok, {users, movies, ratings}}
+    catch
+      error ->
+        {:error, "Failed to load data: #{inspect(error)}"}
+    end
+  end
+
+  def reset_and_setup_database do
+    setup_database()
+  end
+
+  def get_movie_titles(movie_ids) do
+    query = """
+    FOR movie IN movies
+    FILTER movie._key IN @movie_ids
+    RETURN {id: movie._key, title: movie.title}
+    """
+    case post("/_db/#{@db_name}/_api/cursor", Jason.encode!(%{query: query, bindVars: %{movie_ids: movie_ids}})) do
+      {:ok, %{status_code: 201, body: %{"result" => result}}} ->
+        Map.new(result, fn %{"id" => id, "title" => title} -> {id, title} end)
+      {:error, %{reason: reason}} ->
+        IO.puts("Error fetching movie titles: #{reason}")
+        %{}
+      unexpected ->
+        IO.puts("Unexpected response while fetching movie titles: #{inspect(unexpected)}")
+        %{}
+    end
+  end
+
+  defp get_all_documents(collection) do
+    query = "FOR doc IN #{collection} RETURN doc"
+    case post("/_db/#{@db_name}/_api/cursor", Jason.encode!(%{query: query})) do
+      {:ok, %{status_code: 201, body: %{"result" => docs}}} -> docs
+      {:error, error} -> raise "Failed to get documents from #{collection}: #{inspect(error)}"
+    end
   end
 end
 
-# Download and load the dataset
-ratings_csv = DataLoader.download_movielens_small()
-ratings_df = DataFrame.load_csv!(ratings_csv)
-
-# Display the first few rows
-IO.inspect(DataFrame.head(ratings_df), label: "First few rows of ratings")
-
-# Print some information about the dataset
-IO.puts("Number of rows: #{DataFrame.n_rows(ratings_df)}")
-IO.puts("Number of columns: #{DataFrame.n_columns(ratings_df)}")
-IO.inspect(DataFrame.names(ratings_df), label: "Column names")
 ```
 
-## Preprocessing Data
+<!-- livebook:{"output":true} -->
+
+```
+{:module, ArangoDBClient, <<70, 79, 82, 49, 0, 0, 102, ...>>, {:get_all_documents, 1}}
+```
+
+## Data Loading and Insertion
 
 ```elixir
-# Preprocess the data
-users = DataFrame.pull(ratings_df, "userId")
-movies = DataFrame.pull(ratings_df, "movieId")
-ratings = DataFrame.pull(ratings_df, "rating")
+defmodule DataLoader do
+  def download_movielens_small do
+    url = "https://files.grouplens.org/datasets/movielens/ml-latest-small.zip"
+    case HTTPoison.get(url) do
+      {:ok, %{body: body}} ->
+        case :zip.unzip(body, [:memory]) do
+          {:ok, files} ->
+            ratings_csv = extract_csv(files, "ratings.csv")
+            movies_csv = extract_csv(files, "movies.csv")
+            {ratings_csv, movies_csv}
+          {:error, reason} ->
+            IO.puts("Error unzipping file: #{inspect(reason)}")
+            {nil, nil}
+        end
+      {:error, reason} ->
+        IO.puts("Error downloading file: #{inspect(reason)}")
+        {nil, nil}
+    end
+  end
 
-n_users = users |> Series.distinct() |> Series.count()
-n_movies = movies |> Series.distinct() |> Series.count()
+  defp extract_csv(files, filename) do
+    Enum.find_value(files, fn {name, content} ->
+      name = to_string(name)
+      if String.ends_with?(name, filename), do: content
+    end)
+  end
 
-# Convert to tensors
-x_users = Nx.tensor(Series.to_list(users))
-x_movies = Nx.tensor(Series.to_list(movies))
-y_ratings = Nx.tensor(Series.to_list(ratings))
+  def parse_csv(csv_content, :movies) when is_binary(csv_content) do
+    csv_content
+    |> String.split("\n", trim: true)
+    |> Enum.drop(1)  # Remove header
+    |> Enum.map(&parse_movie_line/1)
+  end
 
-# Print some information about the preprocessed data
-IO.puts("Number of unique users: #{n_users}")
-IO.puts("Number of unique movies: #{n_movies}")
-IO.puts("Shape of x_users tensor: #{inspect(Nx.shape(x_users))}")
-IO.puts("Shape of x_movies tensor: #{inspect(Nx.shape(x_movies))}")
-IO.puts("Shape of y_ratings tensor: #{inspect(Nx.shape(y_ratings))}")
+  def parse_csv(csv_content, :ratings) when is_binary(csv_content) do
+    csv_content
+    |> String.split("\n", trim: true)
+    |> Enum.drop(1)  # Remove header
+    |> Enum.map(&parse_rating_line/1)
+  end
+
+  def parse_csv(nil, _), do: []
+
+  defp parse_movie_line(line) do
+    line
+    |> String.trim()
+    |> String.split(",", parts: 3)  # Split into 3 parts: id, title, genres
+    |> Enum.map(&String.trim/1)
+  end
+
+  defp parse_rating_line(line) do
+    line
+    |> String.trim()
+    |> String.split(",", parts: 4)  # Split into 4 parts: user_id, movie_id, rating, timestamp
+    |> Enum.map(&String.trim/1)
+  end
+
+  def insert_data_to_arangodb do
+    {ratings_csv, movies_csv} = download_movielens_small()
+    
+    if is_nil(ratings_csv) or is_nil(movies_csv) do
+      IO.puts("Failed to download or extract CSV data.")
+      :error
+    else
+      insert_movies(movies_csv)
+      insert_users_and_ratings(ratings_csv)
+      IO.puts("Data insertion completed.")
+      :ok
+    end
+  end
+
+  defp insert_movies(movies_csv) do
+    movies = parse_csv(movies_csv, :movies)
+    IO.puts("Inserting #{length(movies)} movies...")
+    
+    Enum.each(movies, fn [movie_id, title, _genres] ->
+      case ArangoDBClient.post("/_db/movie_recommendations/_api/document/movies", Jason.encode!(%{
+        _key: movie_id,
+        title: title
+      })) do
+        {:ok, _} -> nil
+        {:error, reason} -> IO.puts("Error inserting movie #{movie_id}: #{inspect(reason)}")
+      end
+    end)
+  end
+
+  defp insert_users_and_ratings(ratings_csv) do
+    ratings = parse_csv(ratings_csv, :ratings)
+    users = Enum.uniq(Enum.map(ratings, fn [user_id, _, _, _] -> user_id end))
+    
+    IO.puts("Inserting #{length(users)} users...")
+    Enum.each(users, fn user_id ->
+      case ArangoDBClient.post("/_db/movie_recommendations/_api/document/users", Jason.encode!(%{
+        _key: user_id
+      })) do
+        {:ok, _} -> nil
+        {:error, reason} -> IO.puts("Error inserting user #{user_id}: #{inspect(reason)}")
+      end
+    end)
+    
+    IO.puts("Inserting #{length(ratings)} ratings...")
+    Enum.each(ratings, fn [user_id, movie_id, rating, _timestamp] ->
+      case ArangoDBClient.post("/_db/movie_recommendations/_api/document/ratings", Jason.encode!(%{
+        _from: "users/#{user_id}",
+        _to: "movies/#{movie_id}",
+        rating: String.to_float(rating)
+      })) do
+        {:ok, _} -> nil
+        {:error, reason} -> IO.puts("Error inserting rating for user #{user_id}, movie #{movie_id}: #{inspect(reason)}")
+      end
+    end)
+  end
+end
+
 ```
 
 <!-- livebook:{"output":true} -->
 
 ```
-Number of unique users: 610
-Number of unique movies: 9724
-Shape of x_users tensor: {100836}
-Shape of x_movies tensor: {100836}
-Shape of y_ratings tensor: {100836}
+{:module, DataLoader, <<70, 79, 82, 49, 0, 0, 31, ...>>, {:insert_users_and_ratings, 1}}
 ```
 
-<!-- livebook:{"output":true} -->
-
-```
-:ok
-```
-
-## Training and testing sets data
+## Matrix Factorization Model
 
 ```elixir
-# Split the data into training and testing sets
-train_ratio = 0.8
-train_size = floor(Nx.size(x_users) * train_ratio)
-
-{x_users_train, x_users_test} = Nx.split(x_users, train_size)
-{x_movies_train, x_movies_test} = Nx.split(x_movies, train_size)
-{y_ratings_train, y_ratings_test} = Nx.split(y_ratings, train_size)
-
-# Print information about the split
-IO.puts("Shape of x_users_train: #{inspect(Nx.shape(x_users_train))}")
-IO.puts("Shape of x_users_test: #{inspect(Nx.shape(x_users_test))}")
-IO.puts("Shape of x_movies_train: #{inspect(Nx.shape(x_movies_train))}")
-IO.puts("Shape of x_movies_test: #{inspect(Nx.shape(x_movies_test))}")
-IO.puts("Shape of y_ratings_train: #{inspect(Nx.shape(y_ratings_train))}")
-IO.puts("Shape of y_ratings_test: #{inspect(Nx.shape(y_ratings_test))}")
-```
-
-<!-- livebook:{"output":true} -->
-
-```
-Shape of x_users_train: {80668}
-Shape of x_users_test: {20168}
-Shape of x_movies_train: {80668}
-Shape of x_movies_test: {20168}
-Shape of y_ratings_train: {80668}
-Shape of y_ratings_test: {20168}
-```
-
-<!-- livebook:{"output":true} -->
-
-```
-:ok
-```
-
-## Prepare Data
-
-```elixir
-# Prepare the data
-users = DataFrame.pull(ratings_df, "userId")
-movies = DataFrame.pull(ratings_df, "movieId")
-ratings = DataFrame.pull(ratings_df, "rating")
-
-n_users = users |> Series.distinct() |> Series.count()
-n_movies = movies |> Series.distinct() |> Series.count()
-
-# Convert to tensors
-x_users = Nx.tensor(Series.to_list(users))
-x_movies = Nx.tensor(Series.to_list(movies))
-y_ratings = Nx.tensor(Series.to_list(ratings))
-
-# Print some information
-IO.puts("Number of unique users: #{n_users}")
-IO.puts("Number of unique movies: #{n_movies}")
-IO.puts("Shape of ratings tensor: #{inspect(Nx.shape(y_ratings))}")
-```
-
-<!-- livebook:{"output":true} -->
-
-```
-Number of unique users: 610
-Number of unique movies: 9724
-Shape of ratings tensor: {100836}
-```
-
-<!-- livebook:{"output":true} -->
-
-```
-:ok
-```
-
-## Matrix Model
-
-```elixir
-# Create mappings for user IDs and movie IDs
-user_id_map = users |> Series.distinct() |> Series.to_list() |> Enum.with_index() |> Map.new()
-movie_id_map = movies |> Series.distinct() |> Series.to_list() |> Enum.with_index() |> Map.new()
-
-n_users = map_size(user_id_map)
-n_movies = map_size(movie_id_map)
-
-IO.puts("Number of unique users: #{n_users}")
-IO.puts("Number of unique movies: #{n_movies}")
-
-
 defmodule MatrixFactorization do
   import Nx.Defn
 
@@ -200,16 +325,34 @@ defmodule MatrixFactorization do
     pred = predict({user_factors, movie_factors}, user_ids, movie_ids)
     mse = Nx.mean(Nx.pow(pred - ratings, 2))
     reg = lambda * (Nx.sum(Nx.pow(user_factors, 2)) + Nx.sum(Nx.pow(movie_factors, 2)))
-    mse + reg
+    total_loss = mse + reg
+    {total_loss, pred}
   end
 
-  defn update({user_factors, movie_factors}, user_ids, movie_ids, ratings, lr, lambda) do
-    grad = grad({user_factors, movie_factors}, &loss(&1, user_ids, movie_ids, ratings, lambda))
+  defn update(params, user_ids, movie_ids, ratings, lr, lambda) do
+    {_loss, _pred} = loss(params, user_ids, movie_ids, ratings, lambda)
+    {user_factors, movie_factors} = params
+    grad = grad({user_factors, movie_factors}, &elem(loss(&1, user_ids, movie_ids, ratings, lambda), 0))
     {
       user_factors - lr * elem(grad, 0),
       movie_factors - lr * elem(grad, 1)
     }
   end
+
+  def batch_update({user_factors, movie_factors}, user_ids, movie_ids, ratings, lr, lambda, batch_size) do
+    n_samples = Nx.size(user_ids)
+    n_batches = div(n_samples + batch_size - 1, batch_size)
+
+    Enum.reduce(0..(n_batches - 1), {user_factors, movie_factors}, fn i, params ->
+      start_idx = i * batch_size
+      end_idx = min((i + 1) * batch_size, n_samples)
+      batch_user_ids = Nx.slice(user_ids, [start_idx], [end_idx - start_idx])
+      batch_movie_ids = Nx.slice(movie_ids, [start_idx], [end_idx - start_idx])
+      batch_ratings = Nx.slice(ratings, [start_idx], [end_idx - start_idx])
+
+      update(params, batch_user_ids, batch_movie_ids, batch_ratings, lr, lambda)
+    end)
+  end
 end
 
 ```
@@ -217,199 +360,868 @@ end
 <!-- livebook:{"output":true} -->
 
 ```
-Number of unique users: 610
-Number of unique movies: 9724
+{:module, MatrixFactorization, <<70, 79, 82, 49, 0, 0, 28, ...>>, {:batch_update, 7}}
 ```
 
-<!-- livebook:{"output":true} -->
-
-```
-{:module, MatrixFactorization, <<70, 79, 82, 49, 0, 0, 22, ...>>, true}
-```
-
-## Model Train
+## Recommender
 
 ```elixir
-# Data Preprocessing
-user_id_list = users |> Series.distinct() |> Series.to_list()
-movie_id_list = movies |> Series.distinct() |> Series.to_list()
+defmodule Recommender do
+  def train_model({users, movies, ratings}, opts \\ []) do
+    user_id_map = users
+      |> Enum.with_index()
+      |> Map.new(fn {user, index} -> {user["_key"], index} end)
 
-user_id_map = Enum.with_index(user_id_list) |> Map.new(fn {id, index} -> {id, index} end)
-movie_id_map = Enum.with_index(movie_id_list) |> Map.new(fn {id, index} -> {id, index} end)
+    movie_id_map = movies
+      |> Enum.with_index()
+      |> Map.new(fn {movie, index} -> {movie["_key"], index} end)
 
-n_users = map_size(user_id_map)
-n_movies = map_size(movie_id_map)
-
-# Convert to tensors using the mappings
-x_users = Nx.tensor(Enum.map(Series.to_list(users), &Map.get(user_id_map, &1)))
-x_movies = Nx.tensor(Enum.map(Series.to_list(movies), &Map.get(movie_id_map, &1)))
-
-# Normalize ratings to [0, 1] range
-{min_rating, max_rating} = Enum.min_max(Series.to_list(ratings))
-y_ratings = Nx.tensor(Enum.map(Series.to_list(ratings), fn r -> (r - min_rating) / (max_rating - min_rating) end))
-
-# Model parameters
-n_factors = 50
-initial_learning_rate = 0.2
-decay_rate = 0.95
-n_epochs = 50
-batch_size = 8192
-lambda = 0.01  # L2 regularization strength
-
-# Use full dataset instead of sampling
-x_users_train = x_users
-x_movies_train = x_movies
-y_ratings_train = y_ratings
-
-# Initialize model
-params = MatrixFactorization.init_params(n_users, n_movies, n_factors)
-
-# Training loop with learning rate decay
-final_params = Enum.reduce(1..n_epochs, params, fn epoch, current_params ->
-  current_lr = initial_learning_rate * :math.pow(decay_rate, epoch - 1)
-  
-  {total_loss, batch_count, new_params} =
-    Enum.reduce(0..(Nx.size(x_users_train) - 1)//batch_size, {Nx.tensor(0.0), 0, current_params}, fn i, {acc_loss, acc_count, params} ->
-      batch_size = min(batch_size, Nx.size(x_users_train) - i)
-      batch_users = Nx.slice(x_users_train, [i], [batch_size])
-      batch_movies = Nx.slice(x_movies_train, [i], [batch_size])
-      batch_ratings = Nx.slice(y_ratings_train, [i], [batch_size])
-      
-      new_params = MatrixFactorization.update(params, batch_users, batch_movies, batch_ratings, current_lr, lambda)
-      loss = MatrixFactorization.loss(new_params, batch_users, batch_movies, batch_ratings, lambda)
-      {Nx.add(acc_loss, loss), acc_count + 1, new_params}
+    processed_ratings = Enum.filter(ratings, fn rating ->
+      user_id = String.replace(rating["_from"], "users/", "")
+      movie_id = String.replace(rating["_to"], "movies/", "")
+      Map.has_key?(user_id_map, user_id) and Map.has_key?(movie_id_map, movie_id)
+    end)
+    |> Enum.map(fn rating ->
+      user_id = String.replace(rating["_from"], "users/", "")
+      movie_id = String.replace(rating["_to"], "movies/", "")
+      {Map.get(user_id_map, user_id), Map.get(movie_id_map, movie_id), rating["rating"]}
     end)
 
-  avg_loss = Nx.to_number(Nx.divide(total_loss, batch_count))
-  IO.puts("Epoch #{epoch}, Average Loss: #{avg_loss}, Learning Rate: #{current_lr}")
-  
-  new_params
-end)
+    x_users = Nx.tensor(Enum.map(processed_ratings, fn {u, _, _} -> u end))
+    x_movies = Nx.tensor(Enum.map(processed_ratings, fn {_, m, _} -> m end))
+    y_ratings = Nx.tensor(Enum.map(processed_ratings, fn {_, _, r} -> r end))
 
-IO.puts("Training completed!")
+    n_users = map_size(user_id_map)
+    n_movies = map_size(movie_id_map)
+    n_factors = Keyword.get(opts, :n_factors, 20)
+    initial_learning_rate = Keyword.get(opts, :initial_learning_rate, 0.01)
+    decay_rate = Keyword.get(opts, :decay_rate, 0.95)
+    n_epochs = Keyword.get(opts, :n_epochs, 50)
+    batch_size = Keyword.get(opts, :batch_size, 1024)
+    lambda = Keyword.get(opts, :lambda, 0.01)
+    algorithm = Keyword.get(opts, :algorithm, :matrix_factorization)
 
-# Evaluate on full dataset
-full_loss = MatrixFactorization.loss(final_params, x_users, x_movies, y_ratings, lambda)
-IO.puts("Full Dataset Loss: #{Nx.to_number(full_loss)}")
+    IO.puts("Number of users: #{n_users}")
+    IO.puts("Number of movies: #{n_movies}")
+    IO.puts("Number of ratings: #{length(processed_ratings)}")
+    IO.puts("x_users shape: #{inspect(Nx.shape(x_users))}")
+    IO.puts("x_movies shape: #{inspect(Nx.shape(x_movies))}")
+    IO.puts("y_ratings shape: #{inspect(Nx.shape(y_ratings))}")
 
-# Function to make predictions
-predict_rating = fn user_id, movie_id ->
-  user_index = Map.get(user_id_map, user_id)
-  movie_index = Map.get(movie_id_map, movie_id)
-  prediction = MatrixFactorization.predict(final_params, Nx.tensor([user_index]), Nx.tensor([movie_index]))
-  denormalized = Nx.multiply(prediction, max_rating - min_rating) |> Nx.add(min_rating)
-  Nx.to_number(Nx.squeeze(denormalized))
+    params = case algorithm do
+      :matrix_factorization -> MatrixFactorization.init_params(n_users, n_movies, n_factors)
+      :ncf -> NeuralCollaborativeFiltering.init_params(n_users, n_movies, n_factors, 64)  # 64 is the number of hidden units
+    end
+
+    final_params = Enum.reduce(1..n_epochs, params, fn epoch, current_params ->
+      current_lr = initial_learning_rate * :math.pow(decay_rate, epoch - 1)
+      
+      {total_loss, batch_count, new_params} =
+        Enum.reduce(0..(Nx.size(x_users) - 1)//batch_size, {Nx.tensor(0.0), 0, current_params}, fn i, {acc_loss, acc_count, params} ->
+          batch_size = min(batch_size, Nx.size(x_users) - i)
+          batch_users = Nx.slice(x_users, [i], [batch_size])
+          batch_movies = Nx.slice(x_movies, [i], [batch_size])
+          batch_ratings = Nx.slice(y_ratings, [i], [batch_size])
+          
+          new_params = case algorithm do
+            :matrix_factorization -> MatrixFactorization.batch_update(params, batch_users, batch_movies, batch_ratings, current_lr, lambda, batch_size)
+            :ncf -> NeuralCollaborativeFiltering.batch_update(params, batch_users, batch_movies, batch_ratings, current_lr, lambda, batch_size)
+          end
+          {loss, _} = case algorithm do
+            :matrix_factorization -> MatrixFactorization.loss(new_params, batch_users, batch_movies, batch_ratings, lambda)
+            :ncf -> NeuralCollaborativeFiltering.loss(new_params, batch_users, batch_movies, batch_ratings, lambda)
+          end
+          {Nx.add(acc_loss, loss), acc_count + 1, new_params}
+        end)
+
+      avg_loss = Nx.to_number(Nx.divide(total_loss, batch_count))
+      #IO.puts("Epoch #{epoch}, Average Loss: #{avg_loss}, Learning Rate: #{current_lr}")
+      
+      new_params
+    end)
+
+    {final_params, user_id_map, movie_id_map, algorithm}
+  end
+
+  def get_recommendations(user_id, n) do
+    case ArangoDBClient.load_data() do
+      {:ok, {users, movies, ratings}} ->
+        {model_params, user_id_map, movie_id_map, algorithm} = train_model({users, movies, ratings})
+
+        user_index = Map.get(user_id_map, to_string(user_id))
+
+        if user_index do
+          movie_ratings = Enum.map(movies, fn movie ->
+            movie_index = Map.get(movie_id_map, movie["_key"])
+            if movie_index do
+              rating = case algorithm do
+                :matrix_factorization -> MatrixFactorization.predict(model_params, Nx.tensor([user_index]), Nx.tensor([movie_index]))
+                :ncf -> NeuralCollaborativeFiltering.predict(model_params, Nx.tensor([user_index]), Nx.tensor([movie_index]))
+              end
+              {movie["_key"], Nx.to_number(Nx.squeeze(rating))}
+            else
+              nil
+            end
+          end)
+          |> Enum.reject(&is_nil/1)
+
+          recommendations = movie_ratings
+            |> Enum.sort_by(&elem(&1, 1), :desc)
+            |> Enum.take(n)
+          
+          movie_ids = Enum.map(recommendations, &elem(&1, 0))
+          titles = ArangoDBClient.get_movie_titles(movie_ids)
+          
+          Enum.map(recommendations, fn {movie_id, score} ->
+            {movie_id, Map.get(titles, movie_id, "Unknown"), score}
+          end)
+        else
+          IO.puts("User ID #{user_id} not found in the dataset.")
+          []
+        end
+
+      {:error, reason} ->
+        IO.puts("Error loading data: #{reason}")
+        []
+    end
+  end
+
+  def evaluate_rmse(test_set, model_params, user_id_map, movie_id_map, algorithm) do
+    squared_errors = Enum.map(test_set, fn rating ->
+      user_id = String.replace(rating["_from"], "users/", "")
+      movie_id = String.replace(rating["_to"], "movies/", "")
+      actual_rating = rating["rating"]
+      user_index = Map.get(user_id_map, user_id)
+      movie_index = Map.get(movie_id_map, movie_id)
+
+      if is_nil(user_index) do
+        IO.puts("Warning: User ID #{user_id} not found in user_id_map")
+        nil
+      else
+        if is_nil(movie_index) do
+          IO.puts("Warning: Movie ID #{movie_id} not found in movie_id_map")
+          nil
+        else
+          predicted_rating = case algorithm do
+            :matrix_factorization -> MatrixFactorization.predict(model_params, Nx.tensor([user_index]), Nx.tensor([movie_index]))
+            :ncf -> NeuralCollaborativeFiltering.predict(model_params, Nx.tensor([user_index]), Nx.tensor([movie_index]))
+          end
+          :math.pow(Nx.to_number(Nx.squeeze(predicted_rating)) - actual_rating, 2)
+        end
+      end
+    end)
+    
+    valid_errors = Enum.filter(squared_errors, &(!is_nil(&1)))
+    
+    if Enum.empty?(valid_errors) do
+      IO.puts("Error: No valid predictions could be made. Check your data and mappings.")
+      :error
+    else
+      rmse = :math.sqrt(Enum.sum(valid_errors) / length(valid_errors))
+      IO.puts("RMSE: #{rmse}")
+      rmse
+    end
+  end
+
+  def cross_validate(k \\ 5, opts \\ []) do
+    case ArangoDBClient.load_data() do
+      {:ok, {users, movies, ratings}} ->
+        shuffled_ratings = Enum.shuffle(ratings)
+        fold_size = div(length(shuffled_ratings), k)
+        
+        folds = Enum.chunk_every(shuffled_ratings, fold_size)
+        verbose = Keyword.get(opts, :verbose, true)
+        
+        {rmse_scores, summaries} = Enum.map_reduce(1..k, [], fn i, acc ->
+          test_set = Enum.at(folds, i - 1)
+          train_set = List.flatten(List.delete_at(folds, i - 1))
+          
+          train_data = {users, movies, train_set}
+          
+          {model_params, user_id_map, movie_id_map, algorithm} = train_model(train_data, Keyword.put(opts, :verbose, verbose))
+          
+          rmse = case evaluate_rmse(test_set, model_params, user_id_map, movie_id_map, algorithm) do
+            :error -> nil
+            value -> value
+          end
+          
+          summary = "Fold #{i} RMSE: #{rmse}"
+          {rmse, [summary | acc]}
+        end)
+        
+        valid_scores = Enum.filter(rmse_scores, &(!is_nil(&1)))
+        
+        if Enum.empty?(valid_scores) do
+          IO.puts("Error: No valid RMSE scores were calculated. Check your data and model.")
+        else
+          avg_rmse = Enum.sum(valid_scores) / length(valid_scores)
+          if verbose do
+            IO.puts("Average RMSE across #{length(valid_scores)} valid folds: #{avg_rmse}")
+          end
+        end
+        
+        training_summary = Enum.join(Enum.reverse(summaries), "\n")
+        
+        {rmse_scores, training_summary}
+
+      {:error, reason} ->
+        IO.puts("Error loading data: #{reason}")
+        {[], "Error: Unable to load data"}
+    end
+  end
+
+  def analyze_ratings(ratings) do
+    ratings = Enum.map(ratings, fn rating -> rating["rating"] end)
+    min_rating = Enum.min(ratings)
+    max_rating = Enum.max(ratings)
+    avg_rating = Enum.sum(ratings) / length(ratings)
+    IO.puts("Rating distribution:")
+    IO.puts("Min: #{min_rating}, Max: #{max_rating}, Avg: #{avg_rating}")
+    
+    # Print histogram
+    histogram = Enum.reduce(ratings, %{}, fn r, acc ->
+      Map.update(acc, Float.round(r, 1), 1, &(&1 + 1))
+    end)
+    Enum.each(histogram, fn {rating, count} ->
+      IO.puts("#{rating}: #{"#" |> String.duplicate(div(count, 100))}")
+    end)
+  end
+
+  def normalize_ratings(ratings) do
+    all_ratings = Enum.map(ratings, fn rating -> rating["rating"] end)
+    min_rating = Enum.min(all_ratings)
+    max_rating = Enum.max(all_ratings)
+    range = max_rating - min_rating
+    
+    Enum.map(ratings, fn rating ->
+      normalized_r = (rating["rating"] - min_rating) / range
+      Map.put(rating, "rating", normalized_r)
+    end)
+  end
 end
-
-# Example predictions
-IO.puts("Example predictions:")
-IO.puts("User #{Enum.at(user_id_list, 0)}, Movie #{Enum.at(movie_id_list, 0)}: #{predict_rating.(Enum.at(user_id_list, 0), Enum.at(movie_id_list, 0))}")
-IO.puts("User #{Enum.at(user_id_list, 0)}, Movie #{Enum.at(movie_id_list, 99)}: #{predict_rating.(Enum.at(user_id_list, 0), Enum.at(movie_id_list, 99))}")
-IO.puts("User #{Enum.at(user_id_list, 99)}, Movie #{Enum.at(movie_id_list, 0)}: #{predict_rating.(Enum.at(user_id_list, 99), Enum.at(movie_id_list, 0))}")
 
 ```
 
 <!-- livebook:{"output":true} -->
 
 ```
-Epoch 1, Average Loss: 408.76544189453125, Learning Rate: 0.2
-Epoch 2, Average Loss: 369.2974853515625, Learning Rate: 0.19
-Epoch 3, Average Loss: 335.3540344238281, Learning Rate: 0.1805
-Epoch 4, Average Loss: 306.01458740234375, Learning Rate: 0.171475
-Epoch 5, Average Loss: 280.533447265625, Learning Rate: 0.16290125
-Epoch 6, Average Loss: 258.30291748046875, Learning Rate: 0.15475618749999998
-Epoch 7, Average Loss: 238.82484436035156, Learning Rate: 0.14701837812499996
-Epoch 8, Average Loss: 221.68881225585938, Learning Rate: 0.13966745921874996
-Epoch 9, Average Loss: 206.55491638183594, Learning Rate: 0.13268408625781244
-Epoch 10, Average Loss: 193.14007568359375, Learning Rate: 0.1260498819449218
-Epoch 11, Average Loss: 181.20755004882812, Learning Rate: 0.11974738784767575
-Epoch 12, Average Loss: 170.55845642089844, Learning Rate: 0.11376001845529193
-Epoch 13, Average Loss: 161.02484130859375, Learning Rate: 0.10807201753252733
-Epoch 14, Average Loss: 152.46441650390625, Learning Rate: 0.10266841665590097
-Epoch 15, Average Loss: 144.75604248046875, Learning Rate: 0.09753499582310592
-Epoch 16, Average Loss: 137.79627990722656, Learning Rate: 0.09265824603195061
-Epoch 17, Average Loss: 131.49635314941406, Learning Rate: 0.08802533373035308
-Epoch 18, Average Loss: 125.77989196777344, Learning Rate: 0.08362406704383542
-Epoch 19, Average Loss: 120.58089447021484, Learning Rate: 0.07944286369164365
-Epoch 20, Average Loss: 115.84219360351562, Learning Rate: 0.07547072050706145
-Epoch 21, Average Loss: 111.51406860351562, Learning Rate: 0.07169718448170838
-Epoch 22, Average Loss: 107.55310821533203, Learning Rate: 0.06811232525762297
-Epoch 23, Average Loss: 103.92142486572266, Learning Rate: 0.0647067089947418
-Epoch 24, Average Loss: 100.58570861816406, Learning Rate: 0.06147137354500472
-Epoch 25, Average Loss: 97.51663970947266, Learning Rate: 0.05839780486775448
-Epoch 26, Average Loss: 94.68840026855469, Learning Rate: 0.055477914624366756
-Epoch 27, Average Loss: 92.07809448242188, Learning Rate: 0.05270401889314841
-Epoch 28, Average Loss: 89.66547393798828, Learning Rate: 0.05006881794849099
-Epoch 29, Average Loss: 87.43245697021484, Learning Rate: 0.047565377051066435
-Epoch 30, Average Loss: 85.36300659179688, Learning Rate: 0.04518710819851311
-Epoch 31, Average Loss: 83.44274139404297, Learning Rate: 0.04292775278858746
-Epoch 32, Average Loss: 81.6588134765625, Learning Rate: 0.04078136514915808
-Epoch 33, Average Loss: 79.99971771240234, Learning Rate: 0.038742296891700174
-Epoch 34, Average Loss: 78.45502471923828, Learning Rate: 0.036805182047115165
-Epoch 35, Average Loss: 77.01543426513672, Learning Rate: 0.034964922944759405
-Epoch 36, Average Loss: 75.67249298095703, Learning Rate: 0.03321667679752143
-Epoch 37, Average Loss: 74.41857147216797, Learning Rate: 0.03155584295764536
-Epoch 38, Average Loss: 73.24674987792969, Learning Rate: 0.029978050809763093
-Epoch 39, Average Loss: 72.1507568359375, Learning Rate: 0.028479148269274935
-Epoch 40, Average Loss: 71.12488555908203, Learning Rate: 0.027055190855811186
-Epoch 41, Average Loss: 70.16393280029297, Learning Rate: 0.025702431313020625
-Epoch 42, Average Loss: 69.26317596435547, Learning Rate: 0.024417309747369595
-Epoch 43, Average Loss: 68.41825103759766, Learning Rate: 0.023196444260001114
-Epoch 44, Average Loss: 67.62521362304688, Learning Rate: 0.022036622047001058
-Epoch 45, Average Loss: 66.88041687011719, Learning Rate: 0.020934790944651005
-Epoch 46, Average Loss: 66.18052673339844, Learning Rate: 0.01988805139741845
-Epoch 47, Average Loss: 65.52247619628906, Learning Rate: 0.01889364882754753
-Epoch 48, Average Loss: 64.90345001220703, Learning Rate: 0.01794896638617015
-Epoch 49, Average Loss: 64.32083892822266, Learning Rate: 0.01705151806686164
-Epoch 50, Average Loss: 63.77224349975586, Learning Rate: 0.01619894216351856
-Training completed!
-Full Dataset Loss: 63.52693176269531
-Example predictions:
-User 1, Movie 1: 0.9534629583358765
-User 1, Movie 1552: 0.23956403136253357
-User 100, Movie 1: 0.4093063473701477
+warning: variable "avg_loss" is unused (if the variable is not meant to be used, prefix it with an underscore)
+└─ recommendation_engine_project.livemd#cell:mfe6baoag67nuz42:69: Recommender.train_model/2
+
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, Recommender, <<70, 79, 82, 49, 0, 0, 73, ...>>, {:normalize_ratings, 1}}
+```
+
+## NFC Model
+
+```elixir
+defmodule NeuralCollaborativeFiltering do
+  import Nx.Defn
+
+  defn init_params(n_users, n_movies, n_factors, n_hidden) do
+    key = Nx.Random.key(42)
+    {user_embed, key} = Nx.Random.normal(key, 0.0, 0.01, shape: {n_users, n_factors})
+    {movie_embed, key} = Nx.Random.normal(key, 0.0, 0.01, shape: {n_movies, n_factors})
+    {w1, key} = Nx.Random.normal(key, 0.0, 0.01, shape: {2 * n_factors, n_hidden})
+    {w2, _key} = Nx.Random.normal(key, 0.0, 0.01, shape: {n_hidden, 1})
+    b1 = Nx.broadcast(0.0, {n_hidden})
+    b2 = Nx.broadcast(0.0, {1})
+    {user_embed, movie_embed, w1, b1, w2, b2}
+  end
+
+  defn predict({user_embed, movie_embed, w1, b1, w2, b2}, user_ids, movie_ids) do
+    users = Nx.take(user_embed, user_ids)
+    movies = Nx.take(movie_embed, movie_ids)
+    concat = Nx.concatenate([users, movies], axis: 1)
+    hidden = Nx.sigmoid(Nx.dot(concat, w1) + b1)
+    Nx.sigmoid(Nx.dot(hidden, w2) + b2)
+  end
+
+  defn loss(params, user_ids, movie_ids, ratings, lambda) do
+    pred = predict(params, user_ids, movie_ids)
+    mse = Nx.mean(Nx.pow(pred - ratings, 2))
+    reg = lambda * (Nx.sum(Nx.pow(elem(params, 0), 2)) + 
+                    Nx.sum(Nx.pow(elem(params, 1), 2)) + 
+                    Nx.sum(Nx.pow(elem(params, 2), 2)) + 
+                    Nx.sum(Nx.pow(elem(params, 4), 2)))
+    total_loss = mse + reg
+    {total_loss, pred}
+  end
+
+  defn update(params, user_ids, movie_ids, ratings, lr, lambda) do
+    {_loss, _pred} = loss(params, user_ids, movie_ids, ratings, lambda)
+    grad = grad(params, &elem(loss(&1, user_ids, movie_ids, ratings, lambda), 0))
+    Enum.zip(params, grad)
+    |> Enum.map(fn {p, g} -> p - lr * g end)
+    |> List.to_tuple()
+  end
+
+  def batch_update(params, user_ids, movie_ids, ratings, lr, lambda, batch_size) do
+    n_samples = Nx.size(user_ids)
+    n_batches = div(n_samples + batch_size - 1, batch_size)
+
+    Enum.reduce(0..(n_batches - 1), params, fn i, params ->
+      start_idx = i * batch_size
+      end_idx = min((i + 1) * batch_size, n_samples)
+      batch_user_ids = Nx.slice(user_ids, [start_idx], [end_idx - start_idx])
+      batch_movie_ids = Nx.slice(movie_ids, [start_idx], [end_idx - start_idx])
+      batch_ratings = Nx.slice(ratings, [start_idx], [end_idx - start_idx])
+
+      update(params, batch_user_ids, batch_movie_ids, batch_ratings, lr, lambda)
+    end)
+  end
+end
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+{:module, NeuralCollaborativeFiltering, <<70, 79, 82, 49, 0, 0, 33, ...>>, {:batch_update, 7}}
+```
+
+## Setup Application
+
+```elixir
+# Setup and Run
+
+# Check if data exists
+if ArangoDBClient.has_data?() do
+  IO.puts("Data already exists. Skipping database setup and data insertion.")
+else
+  # Setup the database
+  ArangoDBClient.setup_database()
+
+  # Load and insert data from Scidata
+  case DataLoader.insert_data_to_arangodb() do
+    :ok ->
+      IO.puts("Data insertion successful.")
+    :error ->
+      IO.puts("Data insertion failed. Please check the error messages above.")
+      System.halt(1)  # Exit the script if data insertion fails
+  end
+end
+
+# Check collection counts
+IO.puts("Checking collection counts...")
+ArangoDBClient.get_collection_count("users")
+ArangoDBClient.get_collection_count("movies")
+ArangoDBClient.get_collection_count("ratings")
+
+# Get recommendations for a user
+user_id = "1"  # Replace with an actual user ID from your database
+case Recommender.get_recommendations(user_id, 10) do
+  [] ->
+    IO.puts("No recommendations found for user #{user_id}. The user might not exist or have no ratings.")
+  recommendations ->
+    IO.puts("\nTop 10 recommendations for user #{user_id}:")
+    Enum.each(recommendations, fn {movie_id, title, score} ->
+      formatted_title = String.replace(title, ~r/^"|"$/, "")
+      IO.puts("Movie: #{movie_id} - #{formatted_title}, Score: #{:io_lib.format("~.2f", [score])}")
+    end)
+end
+
+# Run cross-validation
+IO.puts("\nRunning cross-validation...")
+{rmse_scores, training_summary} = Recommender.cross_validate(5, verbose: false)
+avg_rmse = Enum.sum(rmse_scores) / length(rmse_scores)
+
+IO.puts("\nTraining Summary:")
+IO.puts(training_summary)
+IO.puts("\nCross-validation Results:")
+IO.puts("Average RMSE: #{:io_lib.format("~.4f", [avg_rmse])}")
+
+```
+
+<!-- livebook:{"output":true} -->
+
+```
+Data already exists. Skipping database setup and data insertion.
+Checking collection counts...
+Number of users: 610
+Number of movies: 1000
+Number of ratings: 588
+x_users shape: {588}
+x_movies shape: {588}
+y_ratings shape: {588}
+
+Top 10 recommendations for user 1:
+Movie: 410 - Addams Family Values (1993), Score: 1.20
+Movie: 616 - Aristocats, Score: 0.97
+Movie: 232 - Eat Drink Man Woman (Yin shi nan nu) (1994), Score: 0.90
+Movie: 219 - Cure, Score: 0.87
+Movie: 1059 - William Shakespeare's Romeo + Juliet (1996), Score: 0.85
+Movie: 897 - For Whom the Bell Tolls (1943), Score: 0.80
+Movie: 490 - Malice (1993), Score: 0.78
+Movie: 981 - Dangerous Ground (1997), Score: 0.75
+Movie: 965 - 39 Steps, Score: 0.72
+Movie: 171 - Jeffrey (1995), Score: 0.71
+
+Running cross-validation...
+Number of users: 610
+Number of movies: 1000
+Number of ratings: 460
+x_users shape: {460}
+x_movies shape: {460}
+y_ratings shape: {460}
+Warning: Movie ID 6238 not found in movie_id_map
+Warning: Movie ID 1573 not found in movie_id_map
+Warning: Movie ID 8665 not found in movie_id_map
+Warning: Movie ID 5048 not found in movie_id_map
+Warning: Movie ID 2529 not found in movie_id_map
+Warning: Movie ID 2762 not found in movie_id_map
+Warning: Movie ID 1805 not found in movie_id_map
+Warning: Movie ID 74458 not found in movie_id_map
+Warning: Movie ID 8783 not found in movie_id_map
+Warning: Movie ID 4308 not found in movie_id_map
+Warning: Movie ID 2858 not found in movie_id_map
+Warning: Movie ID 1734 not found in movie_id_map
+Warning: Movie ID 2596 not found in movie_id_map
+Warning: Movie ID 3591 not found in movie_id_map
+Warning: Movie ID 3703 not found in movie_id_map
+Warning: Movie ID 3508 not found in movie_id_map
+Warning: Movie ID 3204 not found in movie_id_map
+Warning: Movie ID 1704 not found in movie_id_map
+Warning: Movie ID 3869 not found in movie_id_map
+Warning: Movie ID 2273 not found in movie_id_map
+Warning: Movie ID 3060 not found in movie_id_map
+Warning: Movie ID 5952 not found in movie_id_map
+Warning: Movie ID 1580 not found in movie_id_map
+Warning: Movie ID 80489 not found in movie_id_map
+Warning: Movie ID 2090 not found in movie_id_map
+Warning: Movie ID 3033 not found in movie_id_map
+Warning: Movie ID 6863 not found in movie_id_map
+Warning: Movie ID 27741 not found in movie_id_map
+Warning: Movie ID 8798 not found in movie_id_map
+Warning: Movie ID 1892 not found in movie_id_map
+Warning: Movie ID 1517 not found in movie_id_map
+Warning: Movie ID 3793 not found in movie_id_map
+Warning: Movie ID 3024 not found in movie_id_map
+Warning: Movie ID 5218 not found in movie_id_map
+Warning: Movie ID 2872 not found in movie_id_map
+Warning: Movie ID 3441 not found in movie_id_map
+Warning: Movie ID 3489 not found in movie_id_map
+Warning: Movie ID 3639 not found in movie_id_map
+Warning: Movie ID 2947 not found in movie_id_map
+Warning: Movie ID 91529 not found in movie_id_map
+Warning: Movie ID 2671 not found in movie_id_map
+Warning: Movie ID 71535 not found in movie_id_map
+Warning: Movie ID 3538 not found in movie_id_map
+Warning: Movie ID 4896 not found in movie_id_map
+Warning: Movie ID 1927 not found in movie_id_map
+Warning: Movie ID 3916 not found in movie_id_map
+Warning: Movie ID 1348 not found in movie_id_map
+Warning: Movie ID 3703 not found in movie_id_map
+Warning: Movie ID 3408 not found in movie_id_map
+Warning: Movie ID 4765 not found in movie_id_map
+Warning: Movie ID 2467 not found in movie_id_map
+Warning: Movie ID 2617 not found in movie_id_map
+Warning: Movie ID 3317 not found in movie_id_map
+Warning: Movie ID 2973 not found in movie_id_map
+Warning: Movie ID 2005 not found in movie_id_map
+Warning: Movie ID 5764 not found in movie_id_map
+Warning: Movie ID 8808 not found in movie_id_map
+Warning: Movie ID 1834 not found in movie_id_map
+Warning: Movie ID 4963 not found in movie_id_map
+Warning: Movie ID 2826 not found in movie_id_map
+Warning: Movie ID 5746 not found in movie_id_map
+Warning: Movie ID 3273 not found in movie_id_map
+Warning: Movie ID 1920 not found in movie_id_map
+Warning: Movie ID 2571 not found in movie_id_map
+Warning: Movie ID 4033 not found in movie_id_map
+Warning: Movie ID 4886 not found in movie_id_map
+Warning: Movie ID 4014 not found in movie_id_map
+Warning: Movie ID 8907 not found in movie_id_map
+Warning: Movie ID 6534 not found in movie_id_map
+Warning: Movie ID 1620 not found in movie_id_map
+Warning: Movie ID 3044 not found in movie_id_map
+Warning: Movie ID 1587 not found in movie_id_map
+RMSE: 3.8705283697897155
+Number of users: 610
+Number of movies: 1000
+Number of ratings: 470
+x_users shape: {470}
+x_movies shape: {470}
+y_ratings shape: {470}
+Warning: Movie ID 3448 not found in movie_id_map
+Warning: Movie ID 1617 not found in movie_id_map
+Warning: Movie ID 2174 not found in movie_id_map
+Warning: Movie ID 2078 not found in movie_id_map
+Warning: Movie ID 3439 not found in movie_id_map
+Warning: Movie ID 4034 not found in movie_id_map
+Warning: Movie ID 1552 not found in movie_id_map
+Warning: Movie ID 2018 not found in movie_id_map
+Warning: Movie ID 2387 not found in movie_id_map
+Warning: Movie ID 2109 not found in movie_id_map
+Warning: Movie ID 1968 not found in movie_id_map
+Warning: Movie ID 5502 not found in movie_id_map
+Warning: Movie ID 5445 not found in movie_id_map
+Warning: Movie ID 3809 not found in movie_id_map
+Warning: Movie ID 1517 not found in movie_id_map
+Warning: Movie ID 2528 not found in movie_id_map
+Warning: Movie ID 1587 not found in movie_id_map
+Warning: Movie ID 1302 not found in movie_id_map
+Warning: Movie ID 3578 not found in movie_id_map
+Warning: Movie ID 8965 not found in movie_id_map
+Warning: Movie ID 4641 not found in movie_id_map
+Warning: Movie ID 1883 not found in movie_id_map
+Warning: Movie ID 1500 not found in movie_id_map
+Warning: Movie ID 1895 not found in movie_id_map
+Warning: Movie ID 3365 not found in movie_id_map
+Warning: Movie ID 1466 not found in movie_id_map
+Warning: Movie ID 3967 not found in movie_id_map
+Warning: Movie ID 70946 not found in movie_id_map
+Warning: Movie ID 4347 not found in movie_id_map
+Warning: Movie ID 1584 not found in movie_id_map
+Warning: Movie ID 2959 not found in movie_id_map
+Warning: Movie ID 5349 not found in movie_id_map
+Warning: Movie ID 2395 not found in movie_id_map
+Warning: Movie ID 30816 not found in movie_id_map
+Warning: Movie ID 3053 not found in movie_id_map
+Warning: Movie ID 1923 not found in movie_id_map
+Warning: Movie ID 2874 not found in movie_id_map
+Warning: Movie ID 77455 not found in movie_id_map
+Warning: Movie ID 2492 not found in movie_id_map
+Warning: Movie ID 3788 not found in movie_id_map
+Warning: Movie ID 8949 not found in movie_id_map
+Warning: Movie ID 2641 not found in movie_id_map
+Warning: Movie ID 2991 not found in movie_id_map
+Warning: Movie ID 4252 not found in movie_id_map
+Warning: Movie ID 2076 not found in movie_id_map
+Warning: Movie ID 3793 not found in movie_id_map
+Warning: Movie ID 2336 not found in movie_id_map
+Warning: Movie ID 4020 not found in movie_id_map
+Warning: Movie ID 6365 not found in movie_id_map
+Warning: Movie ID 89774 not found in movie_id_map
+Warning: Movie ID 8528 not found in movie_id_map
+Warning: Movie ID 2366 not found in movie_id_map
+Warning: Movie ID 2186 not found in movie_id_map
+Warning: Movie ID 2916 not found in movie_id_map
+Warning: Movie ID 6934 not found in movie_id_map
+Warning: Movie ID 4246 not found in movie_id_map
+Warning: Movie ID 2763 not found in movie_id_map
+Warning: Movie ID 3450 not found in movie_id_map
+Warning: Movie ID 2174 not found in movie_id_map
+Warning: Movie ID 4021 not found in movie_id_map
+Warning: Movie ID 2406 not found in movie_id_map
+Warning: Movie ID 1793 not found in movie_id_map
+Warning: Movie ID 1610 not found in movie_id_map
+Warning: Movie ID 2019 not found in movie_id_map
+Warning: Movie ID 6835 not found in movie_id_map
+Warning: Movie ID 1732 not found in movie_id_map
+Warning: Movie ID 2926 not found in movie_id_map
+Warning: Movie ID 4166 not found in movie_id_map
+Warning: Movie ID 4902 not found in movie_id_map
+Warning: Movie ID 2424 not found in movie_id_map
+Warning: Movie ID 2791 not found in movie_id_map
+Warning: Movie ID 1625 not found in movie_id_map
+Warning: Movie ID 1954 not found in movie_id_map
+Warning: Movie ID 3408 not found in movie_id_map
+Warning: Movie ID 2450 not found in movie_id_map
+Warning: Movie ID 4273 not found in movie_id_map
+Warning: Movie ID 1473 not found in movie_id_map
+Warning: Movie ID 8636 not found in movie_id_map
+Warning: Movie ID 5464 not found in movie_id_map
+Warning: Movie ID 5991 not found in movie_id_map
+Warning: Movie ID 3623 not found in movie_id_map
+Warning: Movie ID 2858 not found in movie_id_map
+RMSE: 3.792485470558293
+Number of users: 610
+Number of movies: 1000
+Number of ratings: 470
+x_users shape: {470}
+x_movies shape: {470}
+y_ratings shape: {470}
+Warning: Movie ID 2324 not found in movie_id_map
+Warning: Movie ID 8368 not found in movie_id_map
+Warning: Movie ID 8957 not found in movie_id_map
+Warning: Movie ID 3578 not found in movie_id_map
+Warning: Movie ID 2143 not found in movie_id_map
+Warning: Movie ID 3052 not found in movie_id_map
+Warning: Movie ID 6874 not found in movie_id_map
+Warning: Movie ID 5060 not found in movie_id_map
+Warning: Movie ID 4239 not found in movie_id_map
+Warning: Movie ID 2046 not found in movie_id_map
+Warning: Movie ID 2145 not found in movie_id_map
+Warning: Movie ID 2987 not found in movie_id_map
+Warning: Movie ID 1617 not found in movie_id_map
+Warning: Movie ID 2502 not found in movie_id_map
+Warning: Movie ID 2770 not found in movie_id_map
+Warning: Movie ID 3617 not found in movie_id_map
+Warning: Movie ID 2470 not found in movie_id_map
+Warning: Movie ID 7153 not found in movie_id_map
+Warning: Movie ID 1377 not found in movie_id_map
+Warning: Movie ID 2019 not found in movie_id_map
+Warning: Movie ID 3911 not found in movie_id_map
+Warning: Movie ID 4306 not found in movie_id_map
+Warning: Movie ID 4310 not found in movie_id_map
+Warning: Movie ID 2997 not found in movie_id_map
+Warning: Movie ID 2427 not found in movie_id_map
+Warning: Movie ID 91658 not found in movie_id_map
+Warning: Movie ID 8958 not found in movie_id_map
+Warning: Movie ID 8972 not found in movie_id_map
+Warning: Movie ID 4370 not found in movie_id_map
+Warning: Movie ID 79132 not found in movie_id_map
+Warning: Movie ID 2359 not found in movie_id_map
+Warning: Movie ID 1641 not found in movie_id_map
+Warning: Movie ID 1396 not found in movie_id_map
+Warning: Movie ID 106782 not found in movie_id_map
+Warning: Movie ID 3253 not found in movie_id_map
+Warning: Movie ID 2058 not found in movie_id_map
+Warning: Movie ID 3386 not found in movie_id_map
+Warning: Movie ID 2717 not found in movie_id_map
+Warning: Movie ID 3160 not found in movie_id_map
+Warning: Movie ID 2338 not found in movie_id_map
+Warning: Movie ID 2033 not found in movie_id_map
+Warning: Movie ID 3255 not found in movie_id_map
+Warning: Movie ID 1885 not found in movie_id_map
+Warning: Movie ID 2395 not found in movie_id_map
+Warning: Movie ID 2529 not found in movie_id_map
+Warning: Movie ID 131724 not found in movie_id_map
+Warning: Movie ID 2843 not found in movie_id_map
+Warning: Movie ID 7445 not found in movie_id_map
+Warning: Movie ID 46970 not found in movie_id_map
+Warning: Movie ID 2997 not found in movie_id_map
+Warning: Movie ID 2640 not found in movie_id_map
+Warning: Movie ID 3851 not found in movie_id_map
+Warning: Movie ID 3079 not found in movie_id_map
+Warning: Movie ID 2414 not found in movie_id_map
+Warning: Movie ID 3702 not found in movie_id_map
+Warning: Movie ID 5919 not found in movie_id_map
+Warning: Movie ID 1371 not found in movie_id_map
+Warning: Movie ID 3578 not found in movie_id_map
+Warning: Movie ID 2616 not found in movie_id_map
+Warning: Movie ID 2683 not found in movie_id_map
+Warning: Movie ID 1777 not found in movie_id_map
+Warning: Movie ID 2094 not found in movie_id_map
+Warning: Movie ID 4896 not found in movie_id_map
+Warning: Movie ID 2090 not found in movie_id_map
+Warning: Movie ID 5459 not found in movie_id_map
+Warning: Movie ID 2105 not found in movie_id_map
+Warning: Movie ID 8798 not found in movie_id_map
+Warning: Movie ID 2351 not found in movie_id_map
+Warning: Movie ID 2105 not found in movie_id_map
+Warning: Movie ID 2683 not found in movie_id_map
+Warning: Movie ID 1804 not found in movie_id_map
+Warning: Movie ID 115713 not found in movie_id_map
+Warning: Movie ID 1719 not found in movie_id_map
+Warning: Movie ID 1907 not found in movie_id_map
+Warning: Movie ID 48516 not found in movie_id_map
+Warning: Movie ID 2329 not found in movie_id_map
+Warning: Movie ID 4993 not found in movie_id_map
+Warning: Movie ID 1733 not found in movie_id_map
+Warning: Movie ID 3083 not found in movie_id_map
+Warning: Movie ID 2692 not found in movie_id_map
+Warning: Movie ID 8865 not found in movie_id_map
+Warning: Movie ID 5618 not found in movie_id_map
+RMSE: 3.907058540900574
+Number of users: 610
+Number of movies: 1000
+Number of ratings: 475
+x_users shape: {475}
+x_movies shape: {475}
+y_ratings shape: {475}
+Warning: Movie ID 1500 not found in movie_id_map
+Warning: Movie ID 7899 not found in movie_id_map
+Warning: Movie ID 2716 not found in movie_id_map
+Warning: Movie ID 3358 not found in movie_id_map
+Warning: Movie ID 4223 not found in movie_id_map
+Warning: Movie ID 1947 not found in movie_id_map
+Warning: Movie ID 2628 not found in movie_id_map
+Warning: Movie ID 2291 not found in movie_id_map
+Warning: Movie ID 2282 not found in movie_id_map
+Warning: Movie ID 2093 not found in movie_id_map
+Warning: Movie ID 8961 not found in movie_id_map
+Warning: Movie ID 122882 not found in movie_id_map
+Warning: Movie ID 60756 not found in movie_id_map
+Warning: Movie ID 3440 not found in movie_id_map
+Warning: Movie ID 1676 not found in movie_id_map
+Warning: Movie ID 8360 not found in movie_id_map
+Warning: Movie ID 86345 not found in movie_id_map
+Warning: Movie ID 2012 not found in movie_id_map
+Warning: Movie ID 2054 not found in movie_id_map
+Warning: Movie ID 3527 not found in movie_id_map
+Warning: Movie ID 2268 not found in movie_id_map
+Warning: Movie ID 1917 not found in movie_id_map
+Warning: Movie ID 4002 not found in movie_id_map
+Warning: Movie ID 2571 not found in movie_id_map
+Warning: Movie ID 3175 not found in movie_id_map
+Warning: Movie ID 2644 not found in movie_id_map
+Warning: Movie ID 3996 not found in movie_id_map
+Warning: Movie ID 2692 not found in movie_id_map
+Warning: Movie ID 2116 not found in movie_id_map
+Warning: Movie ID 8207 not found in movie_id_map
+Warning: Movie ID 4643 not found in movie_id_map
+Warning: Movie ID 8908 not found in movie_id_map
+Warning: Movie ID 2080 not found in movie_id_map
+Warning: Movie ID 2542 not found in movie_id_map
+Warning: Movie ID 2096 not found in movie_id_map
+Warning: Movie ID 2459 not found in movie_id_map
+Warning: Movie ID 1408 not found in movie_id_map
+Warning: Movie ID 2700 not found in movie_id_map
+Warning: Movie ID 3479 not found in movie_id_map
+Warning: Movie ID 112552 not found in movie_id_map
+Warning: Movie ID 4027 not found in movie_id_map
+Warning: Movie ID 4074 not found in movie_id_map
+Warning: Movie ID 2389 not found in movie_id_map
+Warning: Movie ID 2580 not found in movie_id_map
+Warning: Movie ID 5989 not found in movie_id_map
+Warning: Movie ID 2353 not found in movie_id_map
+Warning: Movie ID 4844 not found in movie_id_map
+Warning: Movie ID 3481 not found in movie_id_map
+Warning: Movie ID 3949 not found in movie_id_map
+Warning: Movie ID 3243 not found in movie_id_map
+Warning: Movie ID 8970 not found in movie_id_map
+Warning: Movie ID 2712 not found in movie_id_map
+Warning: Movie ID 4700 not found in movie_id_map
+Warning: Movie ID 3744 not found in movie_id_map
+Warning: Movie ID 3168 not found in movie_id_map
+Warning: Movie ID 8666 not found in movie_id_map
+Warning: Movie ID 3114 not found in movie_id_map
+Warning: Movie ID 2078 not found in movie_id_map
+Warning: Movie ID 2761 not found in movie_id_map
+Warning: Movie ID 7143 not found in movie_id_map
+Warning: Movie ID 2858 not found in movie_id_map
+Warning: Movie ID 114060 not found in movie_id_map
+Warning: Movie ID 2193 not found in movie_id_map
+Warning: Movie ID 2762 not found in movie_id_map
+Warning: Movie ID 26409 not found in movie_id_map
+Warning: Movie ID 1449 not found in movie_id_map
+Warning: Movie ID 2048 not found in movie_id_map
+Warning: Movie ID 2628 not found in movie_id_map
+Warning: Movie ID 2701 not found in movie_id_map
+Warning: Movie ID 3033 not found in movie_id_map
+Warning: Movie ID 1580 not found in movie_id_map
+Warning: Movie ID 3147 not found in movie_id_map
+Warning: Movie ID 2948 not found in movie_id_map
+Warning: Movie ID 3210 not found in movie_id_map
+Warning: Movie ID 2899 not found in movie_id_map
+Warning: Movie ID 2137 not found in movie_id_map
+Warning: Movie ID 72378 not found in movie_id_map
+Warning: Movie ID 2203 not found in movie_id_map
+Warning: Movie ID 1732 not found in movie_id_map
+Warning: Movie ID 2797 not found in movie_id_map
+Warning: Movie ID 1597 not found in movie_id_map
+Warning: Movie ID 4018 not found in movie_id_map
+Warning: Movie ID 1954 not found in movie_id_map
+Warning: Movie ID 1644 not found in movie_id_map
+Warning: Movie ID 2993 not found in movie_id_map
+Warning: Movie ID 2099 not found in movie_id_map
+Warning: Movie ID 2028 not found in movie_id_map
+RMSE: 3.704943103497622
+Number of users: 610
+Number of movies: 1000
+Number of ratings: 477
+x_users shape: {477}
+x_movies shape: {477}
+y_ratings shape: {477}
+Warning: Movie ID 2949 not found in movie_id_map
+Warning: Movie ID 2288 not found in movie_id_map
+Warning: Movie ID 3740 not found in movie_id_map
+Warning: Movie ID 1967 not found in movie_id_map
+Warning: Movie ID 2851 not found in movie_id_map
+Warning: Movie ID 1784 not found in movie_id_map
+Warning: Movie ID 6333 not found in movie_id_map
+Warning: Movie ID 2161 not found in movie_id_map
+Warning: Movie ID 2141 not found in movie_id_map
+Warning: Movie ID 1304 not found in movie_id_map
+Warning: Movie ID 2921 not found in movie_id_map
+Warning: Movie ID 2628 not found in movie_id_map
+Warning: Movie ID 5378 not found in movie_id_map
+Warning: Movie ID 5816 not found in movie_id_map
+Warning: Movie ID 2390 not found in movie_id_map
+Warning: Movie ID 4518 not found in movie_id_map
+Warning: Movie ID 1923 not found in movie_id_map
+Warning: Movie ID 2253 not found in movie_id_map
+Warning: Movie ID 1704 not found in movie_id_map
+Warning: Movie ID 8984 not found in movie_id_map
+Warning: Movie ID 4029 not found in movie_id_map
+Warning: Movie ID 4260 not found in movie_id_map
+Warning: Movie ID 1391 not found in movie_id_map
+Warning: Movie ID 1914 not found in movie_id_map
+Warning: Movie ID 1860 not found in movie_id_map
+Warning: Movie ID 2640 not found in movie_id_map
+Warning: Movie ID 2478 not found in movie_id_map
+Warning: Movie ID 4967 not found in movie_id_map
+Warning: Movie ID 2599 not found in movie_id_map
+Warning: Movie ID 4995 not found in movie_id_map
+Warning: Movie ID 3809 not found in movie_id_map
+Warning: Movie ID 3247 not found in movie_id_map
+Warning: Movie ID 2150 not found in movie_id_map
+Warning: Movie ID 4006 not found in movie_id_map
+Warning: Movie ID 1966 not found in movie_id_map
+Warning: Movie ID 1517 not found in movie_id_map
+Warning: Movie ID 2000 not found in movie_id_map
+Warning: Movie ID 3897 not found in movie_id_map
+Warning: Movie ID 2657 not found in movie_id_map
+Warning: Movie ID 4121 not found in movie_id_map
+Warning: Movie ID 2959 not found in movie_id_map
+Warning: Movie ID 4246 not found in movie_id_map
+Warning: Movie ID 3386 not found in movie_id_map
+Warning: Movie ID 1682 not found in movie_id_map
+Warning: Movie ID 3062 not found in movie_id_map
+Warning: Movie ID 2654 not found in movie_id_map
+Warning: Movie ID 99114 not found in movie_id_map
+Warning: Movie ID 3729 not found in movie_id_map
+Warning: Movie ID 4741 not found in movie_id_map
+Warning: Movie ID 2115 not found in movie_id_map
+Warning: Movie ID 2688 not found in movie_id_map
+Warning: Movie ID 68157 not found in movie_id_map
+Warning: Movie ID 2583 not found in movie_id_map
+Warning: Movie ID 4881 not found in movie_id_map
+Warning: Movie ID 6539 not found in movie_id_map
+Warning: Movie ID 8870 not found in movie_id_map
+Warning: Movie ID 4381 not found in movie_id_map
+Warning: Movie ID 1967 not found in movie_id_map
+Warning: Movie ID 80906 not found in movie_id_map
+Warning: Movie ID 1445 not found in movie_id_map
+Warning: Movie ID 8373 not found in movie_id_map
+Warning: Movie ID 3176 not found in movie_id_map
+Warning: Movie ID 4226 not found in movie_id_map
+Warning: Movie ID 3977 not found in movie_id_map
+Warning: Movie ID 7155 not found in movie_id_map
+Warning: Movie ID 3994 not found in movie_id_map
+Warning: Movie ID 2944 not found in movie_id_map
+Warning: Movie ID 1916 not found in movie_id_map
+Warning: Movie ID 58559 not found in movie_id_map
+Warning: Movie ID 3176 not found in movie_id_map
+Warning: Movie ID 2324 not found in movie_id_map
+Warning: Movie ID 7991 not found in movie_id_map
+Warning: Movie ID 3671 not found in movie_id_map
+Warning: Movie ID 3034 not found in movie_id_map
+Warning: Movie ID 2985 not found in movie_id_map
+Warning: Movie ID 5181 not found in movie_id_map
+Warning: Movie ID 1617 not found in movie_id_map
+Warning: Movie ID 109487 not found in movie_id_map
+Warning: Movie ID 2139 not found in movie_id_map
+Warning: Movie ID 2204 not found in movie_id_map
+Warning: Movie ID 3489 not found in movie_id_map
+Warning: Movie ID 2648 not found in movie_id_map
+Warning: Movie ID 2353 not found in movie_id_map
+Warning: Movie ID 2018 not found in movie_id_map
+Warning: Movie ID 2406 not found in movie_id_map
+Warning: Movie ID 4874 not found in movie_id_map
+Warning: Movie ID 30812 not found in movie_id_map
+Warning: Movie ID 3354 not found in movie_id_map
+Warning: Movie ID 4144 not found in movie_id_map
+RMSE: 3.7685502570217397
+
+Training Summary:
+Fold 1 RMSE: 3.8705283697897155
+Fold 2 RMSE: 3.792485470558293
+Fold 3 RMSE: 3.907058540900574
+Fold 4 RMSE: 3.704943103497622
+Fold 5 RMSE: 3.7685502570217397
+
+Cross-validation Results:
+Average RMSE: 3.8087
 ```
 
 <!-- livebook:{"output":true} -->
 
 ```
 :ok
-```
-
-## Visualizations using VegaLite
-
-```elixir
-alias VegaLite, as: Vl
-require Kino.VegaLite
-
-# Function to get top N recommendations
-get_top_n_recommendations = fn user_id, n ->
-  movie_id_map
-  |> Enum.map(fn {movie_id, _} ->
-    {movie_id, predict_rating.(user_id, movie_id)}
-  end)
-  |> Enum.sort_by(&elem(&1, 1), :desc)
-  |> Enum.take(n)
-end
-
-# Get recommendations for the first user
-user_id = Enum.at(user_id_list, 0)
-top_10_recommendations = get_top_n_recommendations.(user_id, 10)
-
-# Prepare data for visualization
-recommendation_data = Enum.map(top_10_recommendations, fn {movie_id, rating} ->
-  %{movie_id: to_string(movie_id), predicted_rating: rating}
-end)
-
-# Create the visualization
-graph = Vl.new(width: 400, height: 300)
-|> Vl.data_from_values(recommendation_data)
-|> Vl.mark(:bar)
-|> Vl.encode_field(:x, "movie_id", type: :nominal, title: "Movie ID")
-|> Vl.encode_field(:y, "predicted_rating", type: :quantitative, title: "Predicted Rating")
-|> Vl.encode_field(:color, "predicted_rating", type: :quantitative)
-|> Vl.config(title: %{text: "Top 10 Movie Recommendations for User #{user_id}"})
-
-# Display the graph
-Kino.VegaLite.new(graph)
 ```
